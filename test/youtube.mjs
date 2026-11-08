@@ -1,11 +1,13 @@
 // Unit-test the YouTube plumbing in isolation: URL parsing and the detached
 // command string. These are the parts that fail silently in the app (a bad
 // regex makes the button do nothing), so they get real cases.
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs'
 
-const root = 'C:/Users/user/hermes-soundboard'
+// Resolved from this file, not a hardcoded checkout path, so the suite runs
+// from any clone on any platform (it was born pointing at C:/Users/user).
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const src = fs.readFileSync(path.join(root, 'plugin.js'), 'utf8')
 
 // Pull the pure helpers out of the module source and evaluate them alone —

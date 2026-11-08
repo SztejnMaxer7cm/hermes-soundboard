@@ -178,6 +178,133 @@ await build({
   nodePaths: [depsRoot]
 })
 
+// The browser host's twin of the entry above: same plugin, same UI, but the
+// ctx the webapp would give it — every `ctx.files` call resolves the host's
+// "unavailable" sentinel (apps/desktop's browser bridge implements plugin
+// loading, not `pluginFiles`), and `ctx.storage` is localStorage, which is
+// what the real host backs plugin storage with (src/contrib/plugin.ts →
+// readKey/writeKey). Real IndexedDB, the same one the fallback store uses,
+// comes with the browser itself.
+const webappEntryPath = path.join(outDir, 'webapp-entry.js')
+const webappBundlePath = path.join(outDir, 'webapp-bundle.mjs')
+
+fs.writeFileSync(
+  webappEntryPath,
+  `
+import { createRoot } from 'react-dom/client'
+import { jsx } from 'react/jsx-runtime'
+import plugin from ${JSON.stringify(path.join(root, 'plugin.js').replace(/\\\\/g, '/'))}
+import { registerPluginI18n } from ${JSON.stringify(path.join(here, 'sdk-stub.mjs').replace(/\\\\/g, '/'))}
+
+const RealAudio = window.Audio
+window.__audios = []
+window.Audio = function (src) {
+  const audio = new RealAudio(src)
+  window.__audios.push(audio)
+  return audio
+}
+window.Audio.prototype = RealAudio.prototype
+
+// The door every op refuses — the exact result createPluginFiles returns
+// when the window bridge has no pluginFiles member.
+const NO_DOOR = { ok: false, error: 'unavailable', message: 'This Hermes Desktop build has no plugin file access.' }
+
+// The real host's plugin storage: namespaced localStorage keys.
+const scoped = key => 'hermes.plugin.' + plugin.id + '.' + key
+
+const notices = []
+const contributions = {}
+let settingsPage = null
+
+const ctx = {
+  source: 'plugin:hermes-soundboard',
+  i18n: {
+    register: bundle => { window.__locales = bundle; registerPluginI18n(plugin.id, bundle) },
+    t: (key, ...args) => {
+      const value = window.__locales && window.__locales.en && window.__locales.en[key]
+      return typeof value === 'function' ? value(...args) : (value === undefined ? key : value)
+    }
+  },
+  storage: {
+    get: (key, fallback) => {
+      const raw = window.localStorage.getItem(scoped(key))
+      if (raw === null) return fallback
+      try { return JSON.parse(raw) } catch { return fallback }
+    },
+    set: (key, value) => window.localStorage.setItem(scoped(key), JSON.stringify(value)),
+    remove: key => window.localStorage.removeItem(scoped(key))
+  },
+  files: {
+    dataFolder: 'data',
+    folders: async () => [],
+    requestFolder: async () => NO_DOOR,
+    release: async () => false,
+    list: async () => NO_DOOR,
+    stat: async () => NO_DOOR,
+    readText: async () => NO_DOOR,
+    readDataUrl: async () => NO_DOOR,
+    writeText: async () => NO_DOOR,
+    rename: async () => NO_DOOR,
+    trash: async () => NO_DOOR
+  },
+  notify: opts => notices.push(opts),
+  onEvent: () => () => {},
+  onDispose: () => {},
+  register: c => { contributions[c.id] = c },
+  registerMany: list => { for (const c of list) contributions[c.id] = c },
+  registerSettingsPage: page => { settingsPage = page },
+  setTimeout, setInterval, addEventListener: () => () => {},
+  os: {}, pet: { visible: false, say: () => () => {}, clear: () => {} }
+}
+
+plugin.register(ctx)
+window.__engine = ctx.__engine
+window.__contrib = contributions
+window.__settingsPage = settingsPage
+createRoot(document.getElementById('chip')).render(jsx(contributions.chip.render, {}))
+
+// Read the fallback store's keys straight out of the browser's own IndexedDB,
+// so the assertions are on the real database, not a stub. A database with no
+// clip store reads as "no clips" (opening a name that never existed creates
+// an empty one), so a host that stored nothing fails checks, not the suite.
+window.__clipKeys = async () => {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open('hermes-soundboard')
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+  if (![...db.objectStoreNames].includes('clips')) return []
+  return await new Promise((resolve, reject) => {
+    const tx = db.transaction('clips', 'readonly')
+    const request = tx.objectStore('clips').getAllKeys()
+    tx.oncomplete = () => resolve(request.result)
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+window.__state = () => ({
+  sounds: JSON.parse(window.localStorage.getItem(scoped('sounds')) || 'null'),
+  settings: JSON.parse(window.localStorage.getItem(scoped('settings')) || 'null'),
+  notices: notices.slice()
+})
+window.__ready = true
+`
+)
+
+await build({
+  absWorkingDir: root,
+  entryPoints: [webappEntryPath],
+  outfile: webappBundlePath,
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  target: ['chrome110'],
+  logLevel: 'silent',
+  define: { 'process.env.NODE_ENV': '"production"' },
+  alias: { '@hermes/plugin-sdk': path.join(here, 'sdk-stub.mjs') },
+  nodePaths: [depsRoot]
+})
+
 fs.writeFileSync(
   pagePath,
   `<!doctype html><html><head><meta charset="utf-8"><style>
@@ -189,6 +316,14 @@ fs.writeFileSync(
   </style></head>
   <body><div id="statusbar"><span id="chip"></span></div>
   <script type="module" src="./setup-bundle.mjs"></script></body></html>`
+)
+
+const webappPagePath = path.join(outDir, 'webapp.html')
+fs.writeFileSync(
+  webappPagePath,
+  fs
+    .readFileSync(pagePath, 'utf8')
+    .replace('setup-bundle.mjs', 'webapp-bundle.mjs')
 )
 
 function findChrome() {
@@ -529,6 +664,139 @@ check('names are made unique rather than duplicated', () => {
   const names = (finalState.sounds || []).map(sound => sound.name)
   if (new Set(names).size !== names.length) throw new Error(`duplicates in ${names.join(',')}`)
 })
+
+// ── 8. the browser host: no files door, IndexedDB clips, a real reload ────
+// Hermes Desktop is also served as a web app, where this same renderer runs
+// in a browser tab with a window bridge that implements plugin loading but
+// NOT `pluginFiles`: `ctx.files` is an object whose every call resolves
+// "unavailable", plugin storage is localStorage, and IndexedDB is the
+// browser's real one. A fresh context gives the page a clean origin state,
+// the way a first visit would. Import used to skip every pad there.
+const webappContext = await browser.newContext({
+  viewport: { width: 520, height: 780 },
+  deviceScaleFactor: 2,
+  acceptDownloads: true
+})
+const webappPage = await webappContext.newPage()
+webappPage.on('pageerror', error => console.log(`[webapp:error] ${error.message}`))
+
+await webappPage.goto(`http://127.0.0.1:${server.address().port}/webapp.html`)
+await webappPage.waitForFunction(() => window.__ready === true)
+await webappPage.click('#chip button')
+await webappPage.waitForSelector('.hermes-sb-panel')
+
+const webappState = () => webappPage.evaluate(() => window.__state())
+const webappSettle = async (predicate, label, timeout = 8000) => {
+  try {
+    await webappPage.waitForFunction(predicate, { timeout })
+    return true
+  } catch {
+    console.log(`FAIL  ${label} (timed out)`)
+    return false
+  }
+}
+const webappSetupInput = () => webappPage.locator('.hermes-sb-panel input[type=file][accept*="json"]')
+
+// Import the round-trip file — the one carrying the real WAV — as a
+// REPLACEMENT, exactly the way section 3 imports it on the desktop host.
+await webappSetupInput().setInputFiles(exportedPath)
+await webappPage.waitForSelector('.hermes-sb-setup-plan')
+await webappPage.click('.hermes-sb-setup-mode[data-destructive="true"]')
+await webappPage.click('.hermes-sb-setup-confirm button[data-primary="true"]')
+const webappImported = await webappSettle(
+  '!document.querySelector(".hermes-sb-setup-plan") && (window.__state().sounds || []).length === 8',
+  'the browser-host import lands all 8 pads'
+)
+const webappAfterImport = await webappState()
+const webappClap = (webappAfterImport.sounds || []).find(sound => sound.name === 'clap')
+check('a setup file imports on the browser host', () => {
+  if (!webappImported) throw new Error('the import did not produce 8 pads')
+  if (!webappClap) throw new Error(`pads: ${(webappAfterImport.sounds || []).map(sound => sound.name).join(',')}`)
+})
+
+const webappKeys = await webappPage.evaluate(() => window.__clipKeys())
+check('the imported clip lives in the browser’s IndexedDB', () => {
+  if (!webappKeys.includes(webappClap?.id)) throw new Error(`keys: ${JSON.stringify(webappKeys)}`)
+})
+
+if (webappClap) {
+  await webappPage.evaluate(id => {
+    const sound = window.__state().sounds.find(item => item.id === id)
+    window.__engine.play(sound)
+  }, webappClap.id)
+  const webappPlayed = await webappSettle(
+    'window.__audios.some(a => a.currentTime > 0.02)',
+    'the browser-host clip plays'
+  )
+  check('the imported clip decodes and plays on the browser host', () => {
+    if (!webappPlayed) throw new Error('no Audio element advanced past 0.02s')
+  })
+  const webappReady = await webappPage.evaluate(() => window.__audios.at(-1)?.readyState ?? 0)
+  check('the browser-host clip decoded past HAVE_CURRENT_DATA', () => {
+    if (webappReady < 2) throw new Error(`readyState: ${webappReady}`)
+  })
+}
+
+// A reload is the real "does it persist" test: a fresh engine, an empty
+// playback cache, pads from localStorage — and the clip from IndexedDB.
+await webappPage.reload()
+await webappPage.waitForFunction(() => window.__ready === true)
+await webappPage.click('#chip button')
+await webappPage.waitForSelector('.hermes-sb-panel')
+const webappReloaded = await webappState()
+check('the board survives a reload on the browser host', () => {
+  const sounds = webappReloaded.sounds || []
+  if (sounds.length !== 8) throw new Error(`pads: ${sounds.length}`)
+  if (!sounds.some(sound => sound.name === 'clap')) throw new Error('the clip pad did not survive the reload')
+})
+
+if (webappClap) {
+  await webappPage.evaluate(id => {
+    const sound = window.__state().sounds.find(item => item.id === id)
+    window.__engine.play(sound)
+  }, webappClap.id)
+  const webappReplayed = await webappSettle(
+    'window.__audios.some(a => a.currentTime > 0.02)',
+    'the reloaded clip plays from IndexedDB'
+  )
+  check('the clip still plays after a reload (empty cache, IndexedDB read)', () => {
+    if (!webappReplayed) throw new Error('no Audio element advanced past 0.02s after reload')
+  })
+  const webappReReady = await webappPage.evaluate(() => window.__audios.at(-1)?.readyState ?? 0)
+  check('the reloaded clip decoded past HAVE_CURRENT_DATA', () => {
+    if (webappReReady < 2) throw new Error(`readyState: ${webappReReady}`)
+  })
+}
+
+// Exporting must read the clips back out of the store the import wrote them
+// into, or the file would ship pads with no audio.
+const [webappDownload] = await Promise.all([
+  webappPage.waitForEvent('download', { timeout: 15000 }),
+  webappPage.click('.hermes-sb-panel button[aria-label="Export"]')
+])
+const webappTarget = path.join(downloadsDir, 'webapp-roundtrip.json')
+await webappDownload.saveAs(webappTarget)
+check('the browser-host export embeds the clip byte for byte', () => {
+  const bundle = JSON.parse(fs.readFileSync(webappTarget, 'utf8'))
+  const entry = bundle.sounds.find(sound => sound.name === 'clap')
+  if (!entry) throw new Error(`pads: ${bundle.sounds.map(sound => sound.name).join(',')}`)
+  const decoded = Buffer.from(String(entry.audio), 'base64')
+  if (!decoded.equals(wav)) throw new Error(`bytes differ (${decoded.length} vs ${wav.length})`)
+})
+
+if (webappClap) {
+  await webappPage.evaluate(id => window.__engine.remove(id), webappClap.id)
+  const webappRemoved = await webappPage
+    .waitForFunction(id => window.__clipKeys().then(keys => !keys.includes(id)), webappClap.id, { timeout: 5000 })
+    .then(() => true, () => false)
+  const webappAfterRemove = await webappState()
+  check('removing a pad clears the browser store', () => {
+    if ((webappAfterRemove.sounds || []).length !== 7) throw new Error(`pads: ${webappAfterRemove.sounds?.length}`)
+    if (!webappRemoved) throw new Error('the clip is still in IndexedDB')
+  })
+}
+
+await webappContext.close()
 
 // ── report ───────────────────────────────────────────────────────────────
 const failed = results.filter(row => !row.ok)

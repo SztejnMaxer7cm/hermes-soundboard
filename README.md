@@ -37,6 +37,9 @@ mode all persist per machine.
   audio files straight onto the panel. Each file is copied into the plugin's
   private data folder as base64 and read back into a `data:` URL on first play,
   so a custom pad survives restarts without the original file staying put.
+  In the browser (the webapp host, which gives plugins no file door at all),
+  the same clips land in IndexedDB instead — see
+  [How it is built](#how-it-is-built).
 - **YouTube import.** The link button takes a YouTube URL (or a bare video id)
   and adds it as an mp3 pad, through `yt-dlp` + `ffmpeg`. See
   [YouTube import](#youtube-import).
@@ -274,7 +277,12 @@ to keep beside it.
    over the 3 MB per-pad cap).
 2. **Confirm.** `Add to this board` (the default) appends the file's pads after
    yours, skipping any that would pass 40; `Start fresh` replaces the board
-   entirely, moving the clips it displaces to the OS trash.
+   entirely, deleting the clips it displaces (OS trash on the desktop, the
+   browser store in the webapp).
+
+Both steps work identically in the browser: on the webapp host the clips are
+written to IndexedDB, and the imported pads play, survive a reload and
+re-export byte for byte.
 
 Two things an import never does: it never reuses a pad id from the file (ids are
 minted on the machine doing the import, so a file cannot overwrite or address an
@@ -363,7 +371,7 @@ loader resolves at runtime are `@hermes/plugin-sdk` and `react/jsx-runtime`:
 | Command palette | `ctx.register({ area: PALETTE_AREA })` |
 | Settings page | `ctx.registerSettingsPage({...})` |
 | Persistence | `ctx.storage` (sounds + settings + profiles + activeProfile) |
-| Clips | `ctx.files.writeText('data', '<id>.b64', base64)` / `readText` / `trash` |
+| Clips | `ctx.files.writeText('data', '<id>.b64', base64)` / `readText` / `trash`, with an IndexedDB fallback |
 | Sound | WebAudio (`OscillatorNode`, `AudioBufferSourceNode`) and `Audio` |
 | Text | `ctx.i18n.register({ en, pl })` + `usePluginI18n` |
 
@@ -372,28 +380,55 @@ only file door a plugin gets, and it is text (plus `readDataUrl`) oriented. No
 `window.hermesDesktop` calls, no DOM reach into the app, no hardcoded colours —
 all of it is theme variables, so the pads follow whatever skin is active.
 
+**Two hosts, one clip store.** Hermes Desktop also runs as a web app in a
+browser tab, and that host's `window.hermesDesktop` bridge implements plugin
+*loading* but not `pluginFiles`: `ctx.files` is still an object, but every
+operation on it resolves `{ ok: false, error: 'unavailable' }`. A truthiness
+check can never see that — which is why importing a setup file in the browser
+used to skip every pad (a refused clip write is a skipped pad) while nothing
+reported why. The plugin now treats that one answer — the host's own word for
+"there is no door", also used by older Electron shells — as the signal to
+switch stores: clips go to IndexedDB (`hermes-soundboard` / `clips`, keyed by
+pad id, the same base64), which is per-origin and MB-scale, unlike the
+localStorage behind `ctx.storage` that browsers cap around 5 MiB and whose
+quota errors the host swallows. The door is probed once and remembered; any
+other I/O failure is reported as the failure it is, never quietly re-filed
+into a second store. Import, export, playback, upload, duplicate and delete
+all run through the same door-aware store, so a board built in the browser
+survives reloads and exports byte-identically.
+
 Everything read back out of storage is rebuilt field by field before use, so a
 hand-edited or half-written JSON blob degrades to the built-ins instead of
 throwing inside a render.
 
 ## Test
 
-Four suites, all runnable with `npm test`:
+Five suites, all runnable with `npm test`:
 
 ```bash
-npm test            # all four
-npm run test:unit   # jsdom harness, 72 assertions
+npm test            # all five suites
+npm run test:unit   # 43 URL/command unit checks + the jsdom harness
 npm run test:picker # real file picker in Chromium, 8 assertions
 npm run test:ui     # render + geometry + a fired trigger in Chromium
-npm run test:setup  # export / import round trip in Chromium, 33 assertions
+npm run test:setup  # export / import round trip in Chromium, 42 assertions
 ```
+
+**`test/youtube.mjs`** unit-tests the YouTube plumbing outside the app: URL
+parsing and the detached Windows launch command, real cases each. 43 checks.
 
 **`test/harness.mjs`** bundles
 for a stub with the same shapes, mounts every contribution in jsdom and drives
 them the way a user would — click a pad, press a number key, add a file, drop a
 file, refuse an oversized one, rename, delete, stop-all, Escape, then reload the
 plugin and corrupt the stored JSON, then bind pads to gateway events and emit
-real ones to prove only the right pad fires. 38 assertions.
+real ones to prove only the right pad fires. 109 assertions. The closing section
+drives a second engine whose `ctx.files` answers the browser host's
+"unavailable" to every call — the exact webapp condition — against a fake
+IndexedDB with the real database's shapes, and proves an import lands its clips
+in the fallback store, the pads play from it, the door is asked once and then
+never again, a failing store skips pads by name, and a host with no store at all
+refuses the import by name. Confirmed red against the unfixed plugin: 3 named
+failures (import, store contents, repeated door probes).
 
 **`test/picker.mjs`** drives a **real** `<input type="file">` with real `File`
 objects in Chromium: one mp3, the same mp3 twice, two at once, a 4 MB file, a
@@ -414,9 +449,21 @@ the file back — then asserts the imported **clip actually decodes and plays**
 (`currentTime` advanced, `readyState` past `HAVE_CURRENT_DATA`), not merely that a
 pad appeared. It also covers every refusal path (a `.txt`, foreign JSON, a newer
 format version, a bundle whose clip is not base64, a full board) and checks that
-each one names itself and writes nothing. 33 assertions, and it was confirmed to
-go red against three separate reverted fixes: the per-clip size guard, the
-settings assignment, and byte-exact clip embedding.
+each one names itself and writes nothing. 33 of its 42 assertions cover that
+desktop path, and it was confirmed to go red against three separate reverted
+fixes: the per-clip size guard, the settings assignment, and byte-exact clip
+embedding.
+
+The other 9 drive a **second page that reproduces the webapp host**: every
+`ctx.files` call answers the browser bridge's "unavailable", plugin storage is
+localStorage (as the real host's is), and IndexedDB is the browser's own. The
+same round-trip file imports there through the real file input, its clip lands
+in IndexedDB, **decodes and plays in real Chromium**, survives a page reload
+(fresh engine, empty playback cache, clip read back out of the store), exports
+byte for byte, and is deleted from the store with its pad. Against the unfixed
+plugin this section was the reported bug exactly: the import timed out with
+zero clip pads, no clip in the database, no survival across reload, and an
+export with no audio in it — 5 failures, 5 skipped.
 
 **`test/preview.mjs`** renders the same plugin in a real Chromium against the
 app's theme variables and measures the result: pad count, grid columns, and
@@ -428,7 +475,7 @@ containment in the panel, the hint's own left axis. That is what catches a layou
 fine in code and wrong on screen — the padding asymmetry and the orphaned grid
 cell in this plugin were both found that way, not by reading the CSS.
 
-All four borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core`
+All five borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core`
 from an installed Hermes (`HERMES_DEPS_ROOT` points elsewhere if needed),
 precisely because the plugin itself declares no dependencies and this repository
 has no `node_modules`.

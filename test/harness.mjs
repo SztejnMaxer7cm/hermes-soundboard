@@ -176,6 +176,106 @@ window.Audio = class FakeAudio {
 }
 globalThis.Audio = window.Audio
 
+// IndexedDB: jsdom ships none, so the clip fallback store gets a fake with
+// the real database's shapes (open with an upgrade event, transactions that
+// complete after their requests). Handlers fire on a later macrotask — the
+// real database never fires them synchronously, and a synchronous fire here
+// would run before the plugin has attached onsuccess/onerror.
+const makeFakeIndexedDB = () => {
+  const stores = new Map()
+  const state = { fail: false }
+  const queue = []
+  const pump = () => {
+    for (const job of queue.splice(0)) job()
+  }
+  const later = job => {
+    queue.push(job)
+    setTimeout(pump, 0)
+  }
+
+  return {
+    /** Object store name → the live Map of key → value, for direct assertions. */
+    __stores: stores,
+    /** True rejects every open, the way a full disk or a private-mode tab would. */
+    get fail() {
+      return state.fail
+    },
+    set fail(value) {
+      state.fail = value
+    },
+    open(name, version) {
+      const request = { result: undefined, error: null, onsuccess: null, onerror: null, onupgradeneeded: null }
+      later(() => {
+        if (state.fail) {
+          request.error = new Error('The fake database is closed for this test.')
+          request.onerror?.({ target: request })
+          return
+        }
+        // The real database is on request.result BEFORE the upgrade event
+        // fires — the handler reads it to create its object store.
+        request.result = {
+          name,
+          version,
+          objectStoreNames: { contains: store => stores.has(store) },
+          createObjectStore: store => {
+            stores.set(store, new Map())
+            return null
+          },
+          transaction(storeName) {
+            let tx
+            const settle = () => later(() => tx.oncomplete?.({ target: tx }))
+            const objectStore = {
+              get: key => {
+                const get = { result: undefined, error: null, onsuccess: null, onerror: null }
+                later(() => {
+                  get.result = stores.get(storeName)?.get(key)
+                  get.onsuccess?.({ target: get })
+                  settle()
+                })
+                return get
+              },
+              put: (value, key) => {
+                const put = { result: key, error: null, onsuccess: null, onerror: null }
+                later(() => {
+                  // The realistic failure: the database is open and the WRITE
+                  // is refused (a full disk, a private-mode tab). The open
+                  // itself stays cached, exactly like the real one.
+                  if (state.fail) {
+                    put.error = new Error('The fake store refused the write.')
+                    put.onerror?.({ target: put })
+                    later(() => tx.onabort?.({ target: tx }))
+                    return
+                  }
+                  stores.get(storeName)?.set(key, value)
+                  put.onsuccess?.({ target: put })
+                  settle()
+                })
+                return put
+              },
+              delete: key => {
+                const del = { result: undefined, error: null, onsuccess: null, onerror: null }
+                later(() => {
+                  stores.get(storeName)?.delete(key)
+                  del.onsuccess?.({ target: del })
+                  settle()
+                })
+                return del
+              }
+            }
+            tx = { objectStore: () => objectStore, oncomplete: null, onerror: null, onabort: null }
+            return tx
+          }
+        }
+        request.onupgradeneeded?.({ oldVersion: 0, target: request })
+        request.onsuccess?.({ target: request })
+      })
+      return request
+    }
+  }
+}
+const fakeIdb = makeFakeIndexedDB()
+globalThis.indexedDB = fakeIdb
+
 /* ── 4. plugin context ─────────────────────────────────────────────────── */
 
 const storage = new Map()
@@ -193,12 +293,20 @@ const emit = async (type, payload) => {
   await new Promise(resolve => setTimeout(resolve, 0))
 }
 
-const makeCtx = () => {
+/** The browser host's answer to every `ctx.files` op — the exact result
+ *  `createPluginFiles` returns in apps/desktop when the window bridge has no
+ *  `pluginFiles` member, which is the webapp's case. */
+const NO_DOOR = { ok: false, error: 'unavailable', message: 'This Hermes Desktop build has no plugin file access.' }
+
+const makeCtx = ({ webappHost = false } = {}) => {
   const contributions = []
   const settingsPages = []
   const disposers = []
   const locales = {}
   let disposeAll = null
+  // How often the browser host's door was asked, so the suite can prove the
+  // plugin asks once and then remembers the answer.
+  const doorCalls = { list: 0, stat: 0, readText: 0, writeText: 0, trash: 0 }
 
   const ctx = {
     source: 'plugin:hermes-soundboard',
@@ -219,25 +327,59 @@ const makeCtx = () => {
       set: (key, value) => storage.set(key, JSON.stringify(value)),
       remove: key => storage.delete(key)
     },
-    files: {
-      dataFolder: 'data',
-      folders: async () => [],
-      requestFolder: async () => ({ ok: false, error: 'unavailable', message: 'test' }),
-      release: async () => false,
-      list: async () => ({ ok: true, entries: [], truncated: false }),
-      stat: async () => ({ ok: true, exists: false }),
-      readText: async (_folder, p) => (files.has(p) ? { ok: true, text: files.get(p), size: files.get(p).length, mtimeMs: 0 } : { ok: false, error: 'not-found', message: `no ${p}` }),
-      readDataUrl: async () => ({ ok: false, error: 'not-found', message: 'none' }),
-      writeText: async (_folder, p, text) => {
-        files.set(p, text)
-        return { ok: true, path: p, size: text.length, mtimeMs: 0 }
-      },
-      rename: async () => ({ ok: false, error: 'io-error', message: 'unused' }),
-      trash: async (_folder, p) => {
-        files.delete(p)
-        return { ok: true }
-      }
-    },
+    files: webappHost
+      ? {
+          // The browser host's door, exactly as apps/desktop builds it: the
+          // webapp's window bridge implements plugin LOADING but leaves
+          // `pluginFiles` unimplemented, so `ctx.files` is an object whose
+          // every call resolves the host's "there is no door" sentinel —
+          // which is why a truthiness check can never detect it.
+          dataFolder: 'data',
+          folders: async () => [],
+          requestFolder: async () => NO_DOOR,
+          release: async () => false,
+          list: async () => {
+            doorCalls.list += 1
+            return NO_DOOR
+          },
+          stat: async () => {
+            doorCalls.stat += 1
+            return NO_DOOR
+          },
+          readText: async () => {
+            doorCalls.readText += 1
+            return NO_DOOR
+          },
+          readDataUrl: async () => NO_DOOR,
+          writeText: async () => {
+            doorCalls.writeText += 1
+            return NO_DOOR
+          },
+          rename: async () => NO_DOOR,
+          trash: async () => {
+            doorCalls.trash += 1
+            return NO_DOOR
+          }
+        }
+      : {
+          dataFolder: 'data',
+          folders: async () => [],
+          requestFolder: async () => ({ ok: false, error: 'unavailable', message: 'test' }),
+          release: async () => false,
+          list: async () => ({ ok: true, entries: [], truncated: false }),
+          stat: async () => ({ ok: true, exists: false }),
+          readText: async (_folder, p) => (files.has(p) ? { ok: true, text: files.get(p), size: files.get(p).length, mtimeMs: 0 } : { ok: false, error: 'not-found', message: `no ${p}` }),
+          readDataUrl: async () => ({ ok: false, error: 'not-found', message: 'none' }),
+          writeText: async (_folder, p, text) => {
+            files.set(p, text)
+            return { ok: true, path: p, size: text.length, mtimeMs: 0 }
+          },
+          rename: async () => ({ ok: false, error: 'io-error', message: 'unused' }),
+          trash: async (_folder, p) => {
+            files.delete(p)
+            return { ok: true }
+          }
+        },
     notify: opts => notifications.push(opts),
     notifyError: message => notifications.push({ kind: 'error', message }),
     // Gateway event stream: the plugin subscribes by event type. Emitting here
@@ -275,7 +417,7 @@ const makeCtx = () => {
     for (const fn of disposers.reverse()) fn()
   }
 
-  return { ctx, contributions, settingsPages, locales, dispose: disposeAll }
+  return { ctx, contributions, settingsPages, locales, dispose: disposeAll, doorCalls }
 }
 
 /* ── 5. load the plugin ────────────────────────────────────────────────── */
@@ -1496,6 +1638,119 @@ check('every icon the plugin references exists in the SDK', () => {
   }
 })
 iconBoot.dispose()
+
+/* ── 8b. the browser host: no files door, clips in IndexedDB ───────────── */
+
+// Hermes Desktop's webapp runs this plugin in a plain browser tab, where the
+// `window.hermesDesktop` bridge implements plugin loading but leaves
+// `pluginFiles` unimplemented: `ctx.files` is an object, and every operation
+// on it resolves the host's "unavailable" sentinel. Before the fallback clip
+// store, importing a setup file there skipped every pad — writeText refused,
+// and a refused clip is a skipped pad — while every `if (!files)` guard
+// passed, so nothing even reported why. These checks reproduce that host.
+const webapp = makeCtx({ webappHost: true })
+plugin.register(webapp.ctx)
+const webappEngine = webapp.ctx.__engine
+
+const webappClip = Buffer.from('RIFF fake-but-stable clip bytes').toString('base64')
+const webappSetup = JSON.stringify({
+  format: 'hermes-soundboard-setup',
+  version: 1,
+  settings: { volume: 55 },
+  sounds: [
+    { name: 'Beep', kind: 'synth', synth: 'ding' },
+    { name: 'Clap', kind: 'file', mime: 'audio/wav', audio: webappClip, gain: 140, triggers: ['turn.complete'] }
+  ]
+})
+const webappPlan = await webappEngine.readSetupFile(
+  new window.File([webappSetup], 'board.json', { type: 'application/json' })
+)
+const webappImport = await webappEngine.applyBundle(webappPlan)
+const webappClips = () => fakeIdb.__stores.get('clips')
+
+check('a setup file imports on a host with no files door', () => {
+  if (webappImport.added !== 2) {
+    throw new Error(`added=${webappImport.added} skipped=${webappImport.skipped} refused=${webappImport.refused}`)
+  }
+})
+check('the clip lands in the fallback store, not the refused door', () => {
+  const stored = webappEngine.sounds.get().filter(sound => sound.kind === 'file')
+  if (stored.length !== 1) throw new Error(`file pads: ${stored.length}`)
+  if (webappClips().get(stored[0].id) !== webappClip) throw new Error('the stored bytes differ from the file')
+})
+
+const clapId = webappEngine.sounds.get().find(sound => sound.name === 'Clap')?.id
+// Guarded the way setup.mjs guards its playback checks: a broken import must
+// land as named FAILures, not as a crash halfway through the section.
+if (clapId) {
+  const audioBefore = audioElements.length
+  webappEngine.play(webappEngine.sounds.get().find(sound => sound.id === clapId))
+  await waitFor(() => audioElements.length > audioBefore, 'an audio element from the fallback store')
+  check('an imported pad plays from the fallback store', () => {
+    const element = audioElements.at(-1)
+    if (!/^data:audio\/wav;base64,/.test(element.src)) throw new Error(`src=${String(element.src).slice(0, 40)}`)
+  })
+
+  const webappCount = webappEngine.sounds.get().length
+  const copy = await webappEngine.duplicate(clapId)
+  check('a pad copy reads and writes through the fallback store', () => {
+    if (!copy) throw new Error('duplicate() returned null')
+    if (webappEngine.sounds.get().length !== webappCount + 1) throw new Error('the copy was not added')
+    if (webappClips().get(copy.id) !== webappClip) throw new Error('the copied clip is not in the store')
+  })
+
+  if (copy) {
+    webappEngine.remove(copy.id)
+    await waitFor(() => !webappClips().has(copy.id), 'the removed clip to leave the store')
+    check('removing a pad clears the fallback store', () => {
+      if (webappClips().has(copy.id)) throw new Error('the clip is still in the store after delete')
+    })
+  }
+}
+
+// A store that cannot open must be reported, not absorbed: one pad skipped,
+// the rest imported, nothing silently dropped.
+fakeIdb.fail = true
+const refusedPlan = await webappEngine.readSetupFile(
+  new window.File([webappSetup], 'board.json', { type: 'application/json' })
+)
+const refusedImport = await webappEngine.applyBundle(refusedPlan)
+fakeIdb.fail = false
+check('a failing fallback store skips the pads it cannot keep', () => {
+  if (refusedImport.added !== 1) throw new Error(`added=${refusedImport.added}`)
+  if (refusedImport.skipped !== 1) throw new Error(`skipped=${refusedImport.skipped}`)
+})
+
+// The door is probed once — on the first clip write — and remembered; every
+// later operation goes straight to the store instead of round-tripping to a
+// door that cannot open.
+check('the refused door is asked once and never again', () => {
+  if (webapp.doorCalls.writeText !== 1) throw new Error(`writeText was called ${webapp.doorCalls.writeText} times`)
+  if (webapp.doorCalls.readText !== 0) throw new Error(`readText was called ${webapp.doorCalls.readText} times`)
+  if (webapp.doorCalls.trash !== 0) throw new Error(`trash was called ${webapp.doorCalls.trash} times`)
+})
+
+// A host with neither door (an old shell with no files door AND no
+// IndexedDB) refuses the import up front with a reason, as it did before
+// the fallback existed.
+const realIdb = globalThis.indexedDB
+globalThis.indexedDB = undefined
+const bare = makeCtx()
+bare.ctx.files = undefined
+plugin.register(bare.ctx)
+let refused = null
+try {
+  await bare.ctx.__engine.applyBundle(webappPlan)
+} catch (error) {
+  refused = error
+}
+check('a host with no store at all refuses the import by name', () => {
+  if (!refused) throw new Error('the import was not refused')
+  if (!/no plugin file access/i.test(String(refused.message))) throw new Error(`message: ${refused.message}`)
+})
+globalThis.indexedDB = realIdb
+bare.dispose()
+webapp.dispose()
 
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 

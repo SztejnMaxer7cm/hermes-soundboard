@@ -1039,6 +1039,65 @@ function readAsText(file) {
   })
 }
 
+// ── clip fallback store ───────────────────────────────────────────────────
+// Clips normally live in the plugin's data folder through `ctx.files`. The
+// webapp host — Hermes Desktop served in a browser tab — installs a
+// `window.hermesDesktop` bridge that implements plugin LOADING but not
+// `pluginFiles`, so there every `ctx.files` call resolves
+// `{ ok: false, error: 'unavailable' }`: the `ctx.files` object still exists,
+// every `if (!files)` guard still passes, and every read and write quietly
+// fails. An older Electron shell without the file door answers the same way.
+// 'unavailable' is the host's own word for "there is no door" — the one
+// answer that switches stores below. Any other failure is a real I/O problem
+// and is reported as such, never papered over by writing somewhere else.
+//
+// The fallback is IndexedDB: per-origin, MB-scale (unlike the localStorage
+// behind `ctx.storage`, which browsers cap around 5 MiB and whose writes the
+// host swallows quota errors on — a clip "saved" there can vanish silently),
+// and present in every Chromium renderer. Keys are the pad ids, values the
+// same base64 text the data folder holds, so the two stores stay
+// interchangeable and a board that moves between hosts reads the same.
+const CLIP_DB_NAME = 'hermes-soundboard'
+const CLIP_STORE = 'clips'
+
+/** The open database, or null after a failure so the next operation retries. */
+let clipDb = null
+
+function openClipDb() {
+  if (typeof indexedDB === 'undefined') return Promise.reject(new Error('No IndexedDB in this host.'))
+  if (!clipDb) {
+    clipDb = new Promise((resolve, reject) => {
+      const request = indexedDB.open(CLIP_DB_NAME, 1)
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(CLIP_STORE)) request.result.createObjectStore(CLIP_STORE)
+      }
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error ?? new Error('IndexedDB refused to open.'))
+    })
+    // A failed open must not be remembered as the database: the next clip
+    // operation retries. (The rejection stays handled for both callers.)
+    clipDb.catch(() => {
+      clipDb = null
+    })
+  }
+
+  return clipDb
+}
+
+/** One transaction → a promise of the request's result. `oncomplete` is the
+ *  commit point: it fires after the request has settled. */
+async function clipDbRun(mode, run) {
+  const db = await openClipDb()
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIP_STORE, mode)
+    const request = run(tx.objectStore(CLIP_STORE))
+    tx.onerror = () => reject(tx.error ?? new Error('The clip store transaction failed.'))
+    tx.onabort = () => reject(tx.error ?? new Error('The clip store transaction was aborted.'))
+    tx.oncomplete = () => resolve(request.result)
+  })
+}
+
 // ── engine ────────────────────────────────────────────────────────────────
 // All playback, persistence and file I/O lives here; components only read
 // atoms and call verbs. Handlers read atoms imperatively (`.get()`), never
@@ -1169,12 +1228,90 @@ function createEngine(ctx) {
     }
   }
 
+  // ── clip door ────────────────────────────────────────────────────────────
+  // Which store clips go to, decided by the host's own first answer and then
+  // remembered: null while unknown, 'files' once the door has answered ok,
+  // 'idb' once it has answered 'unavailable'. `idbHoldsClips` records whether
+  // the fallback was ever used, so a desktop install that never needed it
+  // never opens (or leaves behind) a database of its own.
+  let clipDoor = null
+  let idbHoldsClips = false
+  const doorless = result => result && result.ok === false && result.error === 'unavailable'
+
+  /** Write one clip's base64. Resolves `{ ok, message? }` — storing a clip is
+   *  the caller's problem to report, never a silent drop. */
+  async function writeClip(id, base64) {
+    const files = ctx.files
+    if (files && clipDoor !== 'idb') {
+      const written = await files.writeText(files.dataFolder, `${id}.b64`, base64)
+      if (written.ok) {
+        clipDoor = 'files'
+        return { ok: true }
+      }
+      // Only the "there is no door" answer switches stores; a quota or I/O
+      // refusal is a real failure and stays one.
+      if (!doorless(written)) return { ok: false, message: written.message }
+      clipDoor = 'idb'
+    }
+    if (typeof indexedDB === 'undefined') return { ok: false, message: t('noFileAccess') }
+    try {
+      await clipDbRun('readwrite', store => store.put(base64, id))
+      idbHoldsClips = true
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /** Read one clip's base64 — the data folder first, then the fallback, which
+   *  also serves boards an earlier, door-less host stored there. */
+  async function readClip(id) {
+    const files = ctx.files
+    if (files && clipDoor !== 'idb') {
+      const read = await files.readText(files.dataFolder, `${id}.b64`)
+      if (read.ok) {
+        clipDoor = 'files'
+        return { ok: true, text: String(read.text ?? '') }
+      }
+      if (!doorless(read)) {
+        const fromDb = await clipDbRead(id)
+        if (fromDb !== undefined) {
+          idbHoldsClips = true
+          return { ok: true, text: String(fromDb) }
+        }
+        return { ok: false, message: read.message }
+      }
+      clipDoor = 'idb'
+    }
+    const fromDb = await clipDbRead(id)
+    if (fromDb !== undefined) {
+      idbHoldsClips = true
+      return { ok: true, text: String(fromDb) }
+    }
+    return { ok: false, message: typeof indexedDB === 'undefined' ? t('noFileAccess') : t('missingAudio') }
+  }
+
+  async function clipDbRead(id) {
+    try {
+      return await clipDbRun('readonly', store => store.get(id))
+    } catch {
+      // A store that cannot even open reads as "no clip here".
+      return undefined
+    }
+  }
+
+  /** Delete a clip from every store that might hold it. Never throws: a clip
+   *  left behind is an orphan, not a broken board. */
+  function removeClip(id) {
+    const files = ctx.files
+    if (files && clipDoor !== 'idb') void files.trash?.(files.dataFolder, `${id}.b64`).catch(() => {})
+    if (idbHoldsClips || clipDoor === 'idb') void clipDbRun('readwrite', store => store.delete(id)).catch(() => {})
+  }
+
   async function playFile(sound, gain) {
     let url = urls.get(sound.id)
     if (!url) {
-      const files = ctx.files
-      if (!files) throw new Error(t('noFileAccess'))
-      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
+      const read = await readClip(sound.id)
       if (!read.ok) throw new Error(read.message || t('missingAudio'))
       url = `data:${sound.mime};base64,${String(read.text).replace(/\s+/g, '')}`
       urls.set(sound.id, url)
@@ -1480,21 +1617,20 @@ function createEngine(ctx) {
 
   /** Copy a clip to a new pad, so a destructive trim can leave the original be. */
   async function duplicate(soundId) {
-    const files = ctx.files
     const sound = sounds.get().find(item => item.id === soundId)
-    if (!sound || !files) return null
+    if (!sound) return null
     if (sounds.get().length >= MAX_SOUNDS) {
       notify({ kind: 'warning', message: t('tooMany') })
       return null
     }
     const id = newId()
     if (sound.kind === 'file') {
-      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
+      const read = await readClip(sound.id)
       if (!read.ok) {
         notify({ kind: 'error', message: read.message || t('missingAudio') })
         return null
       }
-      const written = await files.writeText(files.dataFolder, `${id}.b64`, read.text)
+      const written = await writeClip(id, read.text)
       if (!written.ok) {
         notify({ kind: 'error', message: written.message || t('saveFailed') })
         return null
@@ -1611,11 +1747,6 @@ function createEngine(ctx) {
   }
 
   async function addFile(file) {
-    const files = ctx.files
-    if (!files) {
-      ctx.notify?.({ kind: 'error', message: t('noFileAccess') })
-      return
-    }
     if (!file) return
     if (file.size > MAX_FILE_BYTES) {
       ctx.notify?.({ kind: 'warning', message: t('tooLarge') })
@@ -1642,7 +1773,7 @@ function createEngine(ctx) {
         mime,
         bytes: file.size
       }
-      const written = await files.writeText(files.dataFolder, `${sound.id}.b64`, base64)
+      const written = await writeClip(sound.id, base64)
       if (!written.ok) {
         ctx.notify?.({ kind: 'error', message: written.message || t('saveFailed') })
         return
@@ -1682,12 +1813,11 @@ function createEngine(ctx) {
   function remove(soundId) {
     const target = sounds.get().find(item => item.id === soundId)
     if (!target) return
-    const files = ctx.files
     // Remove from the live set BEFORE deciding about the blob, so the check
     // sees the post-delete world.
     persistSounds(sounds.get().filter(item => item.id !== soundId))
-    if (target.kind === 'file' && !blobInUse(soundId) && files) {
-      void files.trash(files.dataFolder, `${target.id}.b64`).catch(() => {})
+    if (target.kind === 'file' && !blobInUse(soundId)) {
+      removeClip(target.id)
       urls.delete(target.id)
     }
   }
@@ -1813,12 +1943,10 @@ function createEngine(ctx) {
     persistProfiles(profiles.get().filter(profile => profile.id !== profileId))
     if (activeProfile.get() === profileId) setActive(null)
 
-    const files = ctx.files
-    if (!files) return
     for (const sound of target.sounds) {
       if (sound.kind !== 'file') continue
       if (blobInUse(sound.id)) continue
-      void files.trash(files.dataFolder, `${sound.id}.b64`).catch(() => {})
+      removeClip(sound.id)
       urls.delete(sound.id)
     }
   }
@@ -1888,11 +2016,7 @@ function createEngine(ctx) {
 
     for (const sound of current) {
       if (sound.kind !== 'file') continue
-      if (!files) {
-        missing.push(sound.name)
-        continue
-      }
-      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
+      const read = await readClip(sound.id)
       const text = read.ok ? String(read.text ?? '').replace(/\s+/g, '') : ''
       if (!text) {
         missing.push(sound.name)
@@ -1959,17 +2083,20 @@ function createEngine(ctx) {
    *  against what the board already holds — an import ADDS to a board rather
    *  than replacing it, so nobody loses their own pads to someone else's file.
    *  `mode: 'replace'` is the deliberate exception: the imported set becomes the
-   *  board, and the clips it displaces go to the OS trash (recoverable) instead
-   *  of being left as orphans in the data folder.
+   *  board, and the clips it displaces are deleted (OS trash on the desktop,
+   *  the fallback store in the browser) instead of being left as orphans in
+   *  the data folder.
    *
    *  If a clip write fails the pad is not added at all: a pad that cannot play
    *  is worse than a pad that was reported as skipped.
    */
   async function applyBundle(plan, { includeSettings = true, mode = 'add' } = {}) {
-    const files = ctx.files
     const entries = Array.isArray(plan?.entries) ? plan.entries : []
     if (!entries.length) return { added: 0, skipped: 0, removed: 0 }
-    if (entries.some(entry => entry.kind === 'file') && !files) {
+    // Clips go through the door-aware store (see writeClip), so a browser
+    // host with no files door still lands them in IndexedDB. A host with
+    // NEITHER door is refused up front, with the message it earns.
+    if (entries.some(entry => entry.kind === 'file') && !ctx.files && typeof indexedDB === 'undefined') {
       throw new ImportError('noFileAccess', t('noFileAccess'))
     }
     const replace = mode === 'replace'
@@ -1986,7 +2113,7 @@ function createEngine(ctx) {
     for (const entry of wanted) {
       const id = newId()
       if (entry.kind === 'file') {
-        const written = await files.writeText(files.dataFolder, `${id}.b64`, entry.audio)
+        const written = await writeClip(id, entry.audio)
         if (!written.ok) {
           skipped += 1
           continue
@@ -2010,9 +2137,7 @@ function createEngine(ctx) {
     let removed = 0
     if (replace) {
       for (const sound of existing) {
-        if (sound.kind === 'file' && files) {
-          void files.trash(files.dataFolder, `${sound.id}.b64`).catch(() => {})
-        }
+        if (sound.kind === 'file') removeClip(sound.id)
         urls.delete(sound.id)
         removed += 1
       }
