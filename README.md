@@ -360,24 +360,38 @@ file). The plugin is enabled by default; it stays off if you toggle it off in
 
 ## The web build
 
-Hermes also runs in a browser, and there is **no plugin file door** there:
-`ctx.files` resolves `window.hermesDesktop?.pluginFiles`, which is undefined
-outside Electron, so every call answers
-`{ ok: false, error: 'unavailable' }`. Clips live on disk, so anything that
-stores or reads one is desktop-only:
+A browser has no plugin file door: `ctx.files` resolves
+`window.hermesDesktop?.pluginFiles`, which is undefined outside Electron, so
+every call answers `{ ok: false, error: 'unavailable' }`. Desktop clips are files
+on disk, so the plugin keeps them in **IndexedDB** when that door is missing.
+
+The payload is base64 text either way, so playback, export and import keep their
+exact format; only the backing store differs. Routing is by what the door
+*answers*, not by platform — an older desktop shell that reports `unavailable`
+falls back the same way — and a `Map` is the last resort for a browser that also
+refuses IndexedDB.
 
 | Works in the browser | Desktop only |
 |---|---|
-| Synthesised pads, triggers, random pick, one-at-a-time | Adding a sound file |
-| Volume, per-pad gain, pads per row, label | YouTube import |
-| Profiles (save, switch, overwrite, rename, delete) | Trimming clips |
-| Export a setup file (browser download carries it) | Clips inside an export, and importing clip pads |
+| Synthesised pads, triggers, random pick, one-at-a-time | YouTube import |
+| Volume, per-pad gain, pads per row, label | Trimming clips |
+| Adding a sound file, and playing it back | |
+| Profiles (save, switch, overwrite, rename, delete) | |
+| Export/import a setup file, clips included | |
 
-The plugin probes the door at startup and, when it is missing, says so in the
-panel and in Settings, and disables the controls that cannot work — a pad that
-looks clickable and plays nothing is indistinguishable from a bug. A pad that
-already holds a clip also reports the reason when clicked instead of failing
-silently.
+The two desktop-only features shell out (`yt-dlp`, and PowerShell for the trim
+round trip), which a page cannot do.
+
+**Browser storage is not a backup.** IndexedDB is per browser profile and per
+origin: a board built in the web app does not appear in the desktop app and does
+not reach another machine. Browsers also evict it under disk pressure (Safari can
+clear a non-persistent origin after seven days), and a private window gets only a
+small fraction of the quota. Export is what survives all of that.
+
+Quota is not the constraint: Chrome and Edge allow an origin up to 60% of disk,
+Firefox 10% of disk or 10 GiB, Safari 17+ ~60% of disk — against a plugin cap of
+40 pads × 3 MB. When a write is refused the pad reports it rather than going
+silent.
 
 ## How it is built
 

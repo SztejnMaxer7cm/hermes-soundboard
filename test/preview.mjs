@@ -242,6 +242,29 @@ await build({
   nodePaths: [depsRoot]
 })
 
+// A second, self-contained bundle exporting the clip store on its own, so the
+// browser test can exercise the real IndexedDB path. The page bundle cannot be
+// re-imported: its bare specifiers are resolved by an import map that only
+// applies to the document's own module graph.
+const storeEntryPath = path.join(outDir, 'store-entry.mjs')
+fs.writeFileSync(
+  storeEntryPath,
+  `export { createClipStore } from "../plugin.js"\n`
+)
+await build({
+  absWorkingDir: root,
+  entryPoints: [storeEntryPath],
+  outfile: path.join(outDir, 'store-bundle.mjs'),
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  target: ['chrome110'],
+  logLevel: 'silent',
+  define: { 'process.env.NODE_ENV': '"production"' },
+  alias: { '@hermes/plugin-sdk': path.join(here, 'sdk-stub.mjs') },
+  nodePaths: [depsRoot]
+})
+
 // The app's own dark palette (ui-* + the chrome tokens this plugin touches),
 // so what renders here is what the window shows.
 const THEME = `
@@ -713,6 +736,32 @@ console.log(`  menu inside the panel (${hostBox.x},${hostBox.y} ${hostBox.w}x${h
 if (escaped) console.log('!! the menu escapes the panel box — it is being re-anchored by an ancestor (backdrop-filter / transform)')
 if (menu.box.w < 200) console.log(`!! the menu is only ${menu.box.w}px wide — it is confined to the picker's box, not the row's`)
 await shot('preview-menu.png')
+
+// ── the clip store in a real browser ────────────────────────────────────
+// jsdom has no IndexedDB, so the harness only ever proved the in-memory
+// fallback. This exercises the actual database path the web build uses.
+const clipStoreTest = await page.evaluate(async () => {
+  const module = await import('./store-bundle.mjs')
+  const store = module.createClipStore(null) // null files = no desktop door
+  const payload = btoa('clip-bytes-' + Date.now())
+  const written = await store.write('probe-clip', payload)
+  const back = await store.read('probe-clip')
+  await store.remove('probe-clip')
+  const gone = await store.read('probe-clip')
+  const databases = (await indexedDB.databases?.()) ?? []
+  return {
+    hasIndexedDb: typeof indexedDB !== 'undefined',
+    dbListed: databases.some(db => db.name === 'hermes-soundboard'),
+    written,
+    readBack: back.ok ? back.text === payload : false,
+    goneAfterRemove: gone.ok === false
+  }
+})
+console.log(`clip store (real IndexedDB): ${JSON.stringify(clipStoreTest)}`)
+if (!clipStoreTest.hasIndexedDb) console.log('!! no IndexedDB in this browser')
+if (clipStoreTest.written?.ok !== true) console.log('!! the clip was not written')
+if (!clipStoreTest.readBack) console.log('!! the clip did not read back byte-identical')
+if (!clipStoreTest.goneAfterRemove) console.log('!! removing a clip left it readable')
 
 // ── a picker low in the list must still reach its last row ──────────────
 // Reported: opening the trigger list on a row near the bottom left the menu

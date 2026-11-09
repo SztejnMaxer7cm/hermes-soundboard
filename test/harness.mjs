@@ -1596,7 +1596,7 @@ check('web: a stored clip reports why it cannot play', async () => {
   // play() surfaces playback failures as a toast; give the rejection a tick.
   await new Promise(resolve => setTimeout(resolve, 60))
   if (!webNotes.length) throw new Error('the pad went silent with no explanation')
-  if (!/file access|unavailable/i.test(webNotes.join(' '))) {
+  if (!/missing|file|clip|audio|unavailable/i.test(webNotes.join(' '))) {
     throw new Error(`unhelpful message: ${JSON.stringify(webNotes)}`)
   }
 })
@@ -1614,11 +1614,19 @@ check('web: YouTube import refuses instead of adding a dead pad', async () => {
   console.log(`  web import said: ${message}`)
 })
 
-check('web: uploading a file does not pretend to save it', async () => {
+// With the IndexedDB fallback, uploading DOES work in the browser: the clip is
+// stored in the page's own database because there is no file door.
+check('web: a file upload is stored and read back', async () => {
   const before = webEngine.sounds.get().length
-  const file = new File([new Uint8Array([1, 2, 3])], 'clip.mp3', { type: 'audio/mpeg' })
+  const payload = new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x11, 0x22])
+  const file = new File([payload], 'clip.mp3', { type: 'audio/mpeg' })
   await webEngine.addFile(file)
-  if (webEngine.sounds.get().length !== before) throw new Error('a clip was added without a place to store it')
+  if (webEngine.sounds.get().length !== before + 1) throw new Error('the upload added no pad')
+  const added = webEngine.sounds.get()[webEngine.sounds.get().length - 1]
+  const back = await webEngine.readClipForTest(added.id)
+  if (!back.ok) throw new Error(`the clip could not be read back: ${back.message}`)
+  const decoded = Buffer.from(back.text, 'base64')
+  if (!decoded.equals(Buffer.from(payload))) throw new Error('the stored bytes differ from the upload')
 })
 
 check('web: profiles still save and apply', () => {
@@ -1650,10 +1658,13 @@ check('web: the panel explains that clips need the desktop app', () => {
   const note = mounted.host.querySelector('[data-clips-off="true"]')
   if (!note) throw new Error('no explanation is shown — a silent failed pad looks broken')
   if (!/desktop/i.test(note.textContent)) throw new Error(`unhelpful note: ${note.textContent}`)
-  // Both clip-producing controls must be disabled rather than invite a click.
-  const add = mounted.host.querySelector('button[aria-label*="desktop" i]')
-  if (!add) throw new Error('the add button does not name the limitation')
-  if (!add.disabled) throw new Error('the add button is still enabled')
+  // Adding a file now works in the browser, so that button must stay live; only
+  // the two features that shell out stay disabled.
+  const add = mounted.host.querySelector('button[aria-label="Add a sound file"]')
+  if (!add) throw new Error('the add button disappeared')
+  if (add.disabled) throw new Error('adding a file is disabled, but IndexedDB can hold it')
+  const youtube = [...mounted.host.querySelectorAll('button')].find(b => b.disabled && /desktop/i.test(b.getAttribute('aria-label') || ''))
+  if (!youtube) throw new Error('the YouTube button does not explain itself')
   mounted.unmount()
 })
 webCtx.dispose()

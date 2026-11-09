@@ -1044,6 +1044,109 @@ function readAsText(file) {
 // atoms and call verbs. Handlers read atoms imperatively (`.get()`), never
 // through a render closure.
 
+// ── clips ─────────────────────────────────────────────────────────────────
+// Where a clip's bytes live. The payload is base64 text either way, so every
+// existing path (playback, export, import, trim) keeps its exact format.
+//
+//   Desktop — `<id>.b64` in the plugin's data folder, through ctx.files.
+//   Web     — the same text in IndexedDB, because a browser has no file door:
+//             ctx.files resolves window.hermesDesktop?.pluginFiles, which is
+//             undefined outside Electron, so every call answers 'unavailable'.
+//
+// Routing is by what the door ANSWERS, not by platform: an older desktop shell
+// can report 'unavailable' too, and it should then fall back rather than lose
+// the clip. A Map is the last resort, for a browser that also refuses IndexedDB
+// (and for jsdom, which has none).
+function createClipStore(files) {
+  const memory = new Map()
+  let dbPromise = null
+
+  const openDb = () => {
+    if (typeof indexedDB === 'undefined' || !indexedDB) return Promise.resolve(null)
+    if (dbPromise) return dbPromise
+    dbPromise = new Promise(resolve => {
+      try {
+        const request = indexedDB.open('hermes-soundboard', 1)
+        request.onupgradeneeded = () => {
+          request.result.createObjectStore('clips')
+        }
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => resolve(null)
+        request.onblocked = () => resolve(null)
+      } catch {
+        resolve(null)
+      }
+    })
+
+    return dbPromise
+  }
+
+  const withStore = async (mode, run) => {
+    const db = await openDb()
+    if (!db) return undefined
+    try {
+      return await new Promise(resolve => {
+        const transaction = db.transaction('clips', mode)
+        const request = run(transaction.objectStore('clips'))
+        transaction.oncomplete = () => resolve(request ? request.result : undefined)
+        transaction.onerror = () => resolve(undefined)
+        transaction.onabort = () => resolve(undefined)
+        if (!request) resolve(undefined)
+      })
+    } catch {
+      return undefined
+    }
+  }
+
+  const unavailable = result => result && result.ok === false && result.error === 'unavailable'
+
+  async function read(id) {
+    if (files) {
+      const result = await files.readText(files.dataFolder, `${id}.b64`).catch(() => null)
+      if (result && result.ok) return { ok: true, text: String(result.text ?? '').replace(/\s+/g, '') }
+      if (!unavailable(result) && result) return { ok: false, message: result.message || 'unreadable' }
+    }
+    const stored = await withStore('readonly', store => store.get(id))
+    if (typeof stored === 'string') return { ok: true, text: stored }
+    if (memory.has(id)) return { ok: true, text: memory.get(id) }
+
+    return { ok: false, message: 'missing' }
+  }
+
+  async function write(id, base64) {
+    const text = String(base64 ?? '')
+    if (files) {
+      const result = await files.writeText(files.dataFolder, `${id}.b64`, text).catch(() => null)
+      if (result && result.ok) return { ok: true }
+      if (!unavailable(result) && result) return { ok: false, message: result.message || 'unwritable' }
+    }
+    const saved = await withStore('readwrite', store => store.put(text, id))
+    if (saved === undefined && (typeof indexedDB === 'undefined' || !indexedDB)) {
+      memory.set(id, text)
+
+      return { ok: true }
+    }
+    if (saved === undefined) return { ok: false, message: 'quota' }
+    memory.set(id, text)
+
+    return { ok: true }
+  }
+
+  async function remove(id) {
+    memory.delete(id)
+    if (files) {
+      const result = await files.trash(files.dataFolder, `${id}.b64`).catch(() => null)
+      if (result && result.ok) return true
+      if (!unavailable(result) && result) return false
+    }
+    await withStore('readwrite', store => store.delete(id))
+
+    return true
+  }
+
+  return { read, write, remove }
+}
+
 function createEngine(ctx) {
   const t = ctx.i18n.t
   const sounds = atom(cleanSounds(ctx.storage.get('sounds', null)))
@@ -1053,6 +1156,8 @@ function createEngine(ctx) {
    *  'unavailable'. Clips cannot be stored or read without it, so the UI has to
    *  say that rather than let a pad look broken. */
   const fileAccess = atom(null)
+  /** Clip bytes: ctx.files on desktop, IndexedDB in the browser. */
+  const clips = createClipStore(ctx.files)
   /** Saved snapshots of the pads + settings. The live set is what you edit;
    *  a profile is what you restore. */
   const profiles = atom(cleanProfiles(ctx.storage.get('profiles', null)))
@@ -1199,11 +1304,11 @@ function createEngine(ctx) {
   async function playFile(sound, gain) {
     let url = urls.get(sound.id)
     if (!url) {
-      const files = ctx.files
-      if (!files) throw new Error(t('noFileAccess'))
-      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
-      if (!read.ok) throw new Error(read.message || t('missingAudio'))
-      url = `data:${sound.mime};base64,${String(read.text).replace(/\s+/g, '')}`
+      const read = await clips.read(sound.id)
+      if (!read.ok) {
+        throw new Error(read.message && read.message !== 'missing' ? read.message : t('missingAudio'))
+      }
+      url = `data:${sound.mime};base64,${read.text}`
       urls.set(sound.id, url)
     }
     const audio = new Audio(url)
@@ -1638,11 +1743,6 @@ function createEngine(ctx) {
   }
 
   async function addFile(file) {
-    const files = ctx.files
-    if (!files) {
-      ctx.notify?.({ kind: 'error', message: t('noFileAccess') })
-      return
-    }
     if (!file) return
     if (file.size > MAX_FILE_BYTES) {
       ctx.notify?.({ kind: 'warning', message: t('tooLarge') })
@@ -1669,7 +1769,7 @@ function createEngine(ctx) {
         mime,
         bytes: file.size
       }
-      const written = await files.writeText(files.dataFolder, `${sound.id}.b64`, base64)
+      const written = await clips.write(sound.id, base64)
       if (!written.ok) {
         ctx.notify?.({ kind: 'error', message: written.message || t('saveFailed') })
         return
@@ -1714,7 +1814,7 @@ function createEngine(ctx) {
     // sees the post-delete world.
     persistSounds(sounds.get().filter(item => item.id !== soundId))
     if (target.kind === 'file' && !blobInUse(soundId) && files) {
-      void files.trash(files.dataFolder, `${target.id}.b64`).catch(() => {})
+      void clips.remove(target.id)
       urls.delete(target.id)
     }
   }
@@ -1860,12 +1960,11 @@ function createEngine(ctx) {
     persistProfiles(profiles.get().filter(profile => profile.id !== profileId))
     if (activeProfile.get() === profileId) setActive(null)
 
-    const files = ctx.files
-    if (!files) return
     for (const sound of target.sounds) {
       if (sound.kind !== 'file') continue
       if (blobInUse(sound.id)) continue
-      void files.trash(files.dataFolder, `${sound.id}.b64`).catch(() => {})
+      // clips.remove routes itself: file on desktop, IndexedDB in the browser.
+      void clips.remove(sound.id)
       urls.delete(sound.id)
     }
   }
@@ -1935,12 +2034,8 @@ function createEngine(ctx) {
 
     for (const sound of current) {
       if (sound.kind !== 'file') continue
-      if (!files) {
-        missing.push(sound.name)
-        continue
-      }
-      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
-      const text = read.ok ? String(read.text ?? '').replace(/\s+/g, '') : ''
+      const read = await clips.read(sound.id)
+      const text = read.ok ? read.text : ''
       if (!text) {
         missing.push(sound.name)
         continue
@@ -2033,7 +2128,7 @@ function createEngine(ctx) {
     for (const entry of wanted) {
       const id = newId()
       if (entry.kind === 'file') {
-        const written = await files.writeText(files.dataFolder, `${id}.b64`, entry.audio)
+        const written = await clips.write(id, entry.audio)
         if (!written.ok) {
           skipped += 1
           continue
@@ -2058,7 +2153,7 @@ function createEngine(ctx) {
     if (replace) {
       for (const sound of existing) {
         if (sound.kind === 'file' && files) {
-          void files.trash(files.dataFolder, `${sound.id}.b64`).catch(() => {})
+          void clips.remove(sound.id)
         }
         urls.delete(sound.id)
         removed += 1
@@ -2106,6 +2201,8 @@ function createEngine(ctx) {
     activeProfile,
     /** Test seam: the cached playback URL for a pad, or null. Read-only. */
     peekCachedUrl: soundId => urls.get(soundId) ?? null,
+    /** Test seam: read a clip's bytes through the same store playback uses. */
+    readClipForTest: soundId => clips.read(soundId),
     saveProfile,
     overwriteProfile,
     applyProfile,
@@ -2789,6 +2886,7 @@ function TriggerSelect({ sound, engine }) {
 
 function ManageRow({ sound, engine, index = 0 }) {
   const t = usePluginI18n(ID)
+  const fileAccess = useValue(engine.fileAccess)
   const [draft, setDraft] = useState(sound.name)
   // Trimming is destructive, so it opens on demand rather than sitting in every
   // row's tab order — and is only offered for clips, never for a synthesised cue.
@@ -2915,13 +3013,14 @@ function ManageRow({ sound, engine, index = 0 }) {
       }),
       sound.kind === 'file'
         ? jsx(Tip, {
-            label: t('trim'),
+            label: fileAccess === false ? t('clipsDesktopOnly') : t('trim'),
             children: jsx('button', {
               type: 'button',
               className: 'hermes-sb-rowbtn',
               'data-trim': 'true',
               'data-on': trimOpen,
               'aria-expanded': trimOpen,
+              disabled: fileAccess === false,
               'aria-label': `${t('trim')}: ${sound.name}`,
               onClick: () => {
                 setTrimOpen(value => !value)
@@ -3380,12 +3479,12 @@ function Panel({ engine }) {
             })
           }),
           jsx(Tip, {
-            label: fileAccess === false ? t('clipsDesktopOnly') : t('addSound'),
+            label: t('addSound'),
             children: jsx('button', {
               type: 'button',
               className: 'hermes-sb-iconbtn',
-              'aria-label': fileAccess === false ? t('clipsDesktopOnly') : t('addSound'),
-              disabled: saving || fileAccess === false,
+              'aria-label': t('addSound'),
+              disabled: saving,
               onClick: () => fileRef.current?.click(),
               children: saving ? jsx(icons.Loader2, { size: 11 }) : jsx(icons.Plus, { size: 12 })
             })
@@ -4047,8 +4146,7 @@ function SoundboardManager({ engine }) {
           jsx('button', {
             type: 'button',
             className: 'hermes-sb-settings-add',
-            disabled: saving || sounds.length >= MAX_SOUNDS || fileAccess === false,
-            title: fileAccess === false ? t('clipsDesktopOnly') : undefined,
+            disabled: saving || sounds.length >= MAX_SOUNDS,
             onClick: () => fileRef.current?.click(),
             children: saving ? t('saving') : t('addSound')
           }),
@@ -4411,7 +4509,7 @@ const LOCALES = {
     exportMissing: (n, names) =>
       `${n} clip${n === 1 ? '' : 's'} could not be read, so ${n === 1 ? 'it is' : 'they are'} missing from the file: ${names}.`,
     exportFailed: 'The setup file could not be saved.',
-    clipsDesktopOnly: 'Clips need the desktop app — only synthesised pads play here.',
+    clipsDesktopOnly: 'YouTube import and trimming need the desktop app.',
     thisFile: 'this file',
     importPlan: (name, pads) => `“${name}” holds ${pads} pad${pads === 1 ? '' : 's'}`,
     importMode: 'Where the pads go',
@@ -4535,7 +4633,7 @@ const LOCALES = {
     exportedAsk: name => `„${name}” jest gotowy — zapisz go w oknie dialogowym.`,
     exportMissing: (n, names) => `Nie udało się odczytać ${n} klipu/klipów, więc brakuje ich w pliku: ${names}.`,
     exportFailed: 'Nie udało się zapisać pliku zestawu.',
-    clipsDesktopOnly: 'Klipy wymagają aplikacji desktopowej — tutaj grają tylko podkładki syntezowane.',
+    clipsDesktopOnly: 'Import z YouTube i przycinanie wymagają aplikacji desktopowej.',
     thisFile: 'ten plik',
     importPlan: (name, pads) => `„${name}” zawiera ${pads} padów`,
     importMode: 'Gdzie trafią pady',
@@ -4560,6 +4658,7 @@ const LOCALES = {
   }
 }
 
+export { createClipStore }
 export default {
   id: ID,
   name: 'Soundboard',
