@@ -1374,6 +1374,58 @@ check('and back again', () => {
   if (prfEngine.settings.get().volume !== 65) throw new Error('lost settings on the round trip')
 })
 
+// ── overwriting instead of accumulating profiles ─────────────────────────
+// Reported need: "add an option to override existing Profile to prevent users
+// from making many profiles with every change in their setup".
+const ovrCtx = makeCtx()
+plugin.register(ovrCtx.ctx)
+const ovrEngine = ovrCtx.ctx.__engine
+// Start from a known set: the profile tests above left Podcast and Gaming in
+// shared storage, and indexing profiles[0] would then read the wrong board.
+ovrEngine.profiles.get().forEach(profile => ovrEngine.deleteProfile(profile.id))
+ovrEngine.addPreset('pop')
+const ovrId = ovrEngine.saveProfile('Studio')
+const ovrOriginalPads = ovrEngine.profiles.get().find(p => p.id === ovrId).sounds.length
+
+// Change the live board, then save again under the SAME name.
+ovrEngine.addPreset('laser')
+ovrEngine.saveProfile('Studio')
+check('re-saving under an existing name replaces it, not "Studio 2"', () => {
+  const names = ovrEngine.profiles.get().map(profile => profile.name)
+  if (names.length !== 1) throw new Error(`profiles grew to ${JSON.stringify(names)}`)
+  if (names[0] !== 'Studio') throw new Error(`got ${JSON.stringify(names)}`)
+})
+check('the replacement captured the newer board', () => {
+  const stored = ovrEngine.profiles.get()[0].sounds.length
+  if (stored !== ovrOriginalPads + 1) throw new Error(`pads ${stored}, expected ${ovrOriginalPads + 1}`)
+})
+
+// The explicit verb: save INTO a named profile even when its name is not typed.
+ovrEngine.addPreset('beep')
+const beforePads = ovrEngine.profiles.get()[0].sounds.length
+const overwrittenId = ovrEngine.overwriteProfile(ovrId)
+check('overwriteProfile replaces the named profile with the live board', () => {
+  const stored = ovrEngine.profiles.get().find(profile => profile.id === ovrId)
+  if (!stored) throw new Error('the profile disappeared')
+  if (stored.sounds.length !== beforePads + 1) {
+    throw new Error(`pads ${stored.sounds.length}, expected ${beforePads + 1}`)
+  }
+  if (stored.name !== 'Studio') throw new Error(`the name changed to ${stored.name}`)
+  if (overwrittenId !== ovrId) throw new Error('returned the wrong id')
+})
+check('overwriting makes that profile the active one', () => {
+  if (ovrEngine.activeProfile.get() !== ovrId) throw new Error('the live board is not attributed to it')
+})
+
+// Overwriting a DIFFERENT profile must not disturb the open board.
+ovrEngine.saveProfile('Live')
+const livePads = ovrEngine.sounds.get().length
+ovrEngine.overwriteProfile(ovrId)
+check('overwriting another profile leaves the live board intact', () => {
+  if (ovrEngine.sounds.get().length !== livePads) throw new Error('the board changed underneath')
+})
+ovrCtx.dispose()
+
 // ── blob sharing: deleting a pad must not orphan another profile's clip ──
 storage.set('sounds', JSON.stringify([
   { id: 'snd-shared', name: 'Shared', kind: 'file', mime: 'audio/mpeg', bytes: 10 }

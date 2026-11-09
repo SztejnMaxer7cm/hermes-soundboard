@@ -1724,25 +1724,35 @@ function createEngine(ctx) {
   /** Save the current board under a name. Saving over the active profile is
    *  the common case ("I tweaked my podcast board"), so it updates in place
    *  instead of piling up near-duplicates. */
-  function saveProfile(rawName) {
+  function saveProfile(rawName, { overwriteId = null } = {}) {
     const name = cleanName(rawName, 'Profile')
     const active = activeProfile.get()
     const existing = profiles.get()
     const snapshotValue = snapshot()
 
-    // Save-in-place only when the name still matches: typing a different name
-    // means "keep this board as something else", not "rename what is open".
+    // Save-in-place when the name still matches the open profile.
     const activeEntry = existing.find(profile => profile.id === active)
     const sameName = activeEntry && activeEntry.name.toLowerCase() === name.toLowerCase()
+    // Typing the name of a profile that already exists OVERWRITES it. This used
+    // to append " 2" via uniqueName, so every tweak left another near-copy —
+    // exactly the sprawl the Overwrite button exists to prevent.
+    const explicit = overwriteId ? existing.find(profile => profile.id === overwriteId) : null
+    const named = existing.find(profile => profile.name.toLowerCase() === name.toLowerCase())
 
-    if (active && activeEntry && sameName) {
+    const target = explicit ?? (sameName ? activeEntry : named) ?? null
+
+    if (target) {
       const next = existing.map(profile =>
-        profile.id === active ? { ...profile, ...snapshotValue, name } : profile
+        profile.id === target.id
+          // An explicit overwrite keeps the profile's own name: the button means
+          // "save this board into THAT profile", not "rename it".
+          ? { ...profile, ...snapshotValue, name: explicit ? profile.name : name }
+          : profile
       )
       persistProfiles(next)
-      setActive(active)
+      setActive(target.id)
 
-      return active
+      return target.id
     }
 
     if (existing.length >= MAX_PROFILES) {
@@ -1759,6 +1769,16 @@ function createEngine(ctx) {
     setActive(profile.id)
 
     return profile.id
+  }
+
+  /** Save the live board INTO an existing profile, keeping that profile's name.
+   *  This is the direct answer to "one profile per tweak": you pick which saved
+   *  board to replace instead of typing a new name and accumulating copies. */
+  function overwriteProfile(profileId) {
+    const profile = profiles.get().find(item => item.id === profileId)
+    if (!profile) return null
+
+    return saveProfile(profile.name, { overwriteId: profileId })
   }
 
   /** Switch the live board to a saved profile. The previous unsaved board is
@@ -2059,6 +2079,7 @@ function createEngine(ctx) {
     /** Test seam: the cached playback URL for a pad, or null. Read-only. */
     peekCachedUrl: soundId => urls.get(soundId) ?? null,
     saveProfile,
+    overwriteProfile,
     applyProfile,
     renameProfile,
     deleteProfile,
@@ -2300,6 +2321,18 @@ const CSS = `
 .hermes-sb-profile-rename:focus{background-color:var(--ui-bg-primary);border-color:var(--ui-accent);
   outline:none}
 .hermes-sb-profile-count{flex:0 0 auto;font-size:10px;color:var(--ui-text-tertiary)}
+/* Overwrite: a text button, because a bare icon cannot say "replace this saved
+   board". Fixed width because the armed label ("Replace?") is a different length
+   from the resting one, and a control you must click twice in the same place
+   must not move between those clicks. */
+.hermes-sb-profile-overwrite{flex:0 0 auto;min-width:66px;height:21px;padding:0 7px;border-radius:4px;
+  font-size:10px;line-height:14px;text-align:center;color:var(--ui-text-tertiary);
+  background-color:transparent;border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-overwrite:hover{color:var(--ui-text-primary);border-color:var(--ui-accent)}
+/* Armed: weight carries the danger as well as colour, so it is not signalled by
+   hue alone. */
+.hermes-sb-profile-overwrite[data-armed=true]{color:var(--ui-text-primary);font-weight:600;
+  border-color:var(--ui-red);background-color:color-mix(in srgb, var(--ui-red) 20%, transparent)}
 .hermes-sb-trim{flex:0 0 100%;display:flex;align-items:center;gap:5px;flex-wrap:wrap;
   margin:3px 0 2px;padding:5px 4px;border-radius:4px;
   background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary)}
@@ -3682,9 +3715,16 @@ function ProfilePicker({ engine }) {
   }
 
   const save = () => {
-    engine.saveProfile(draft.trim() || active?.name || t('newProfile'))
+    const wanted = draft.trim() || active?.name || t('newProfile')
+    // Naming an existing profile replaces it, so say that rather than "saved" —
+    // the user needs to know a saved board was just overwritten.
+    const replaced = profiles.find(profile => profile.name.toLowerCase() === wanted.toLowerCase())
+    engine.saveProfile(wanted)
     setDraft('')
-    engine.notify({ kind: 'info', message: t('profileSaved') })
+    engine.notify({
+      kind: 'info',
+      message: replaced ? t('profileOverwritten').replace('{name}', replaced.name) : t('profileSaved')
+    })
   }
 
   return jsxs('div', {
@@ -3758,7 +3798,9 @@ function ProfilePicker({ engine }) {
                     'aria-label': active ? t('saveToProfile') : t('saveProfile'),
                     title: active ? t('saveToProfile') : t('saveProfile'),
                     onClick: save,
-                    children: t('saveShort')
+                    children: profiles.some(
+                      profile => profile.name.toLowerCase() === draft.trim().toLowerCase()
+                    ) ? t('overwrite') : t('saveShort')
                   })
                 ]
               })
@@ -3777,6 +3819,9 @@ function ProfileManager({ engine }) {
   const profiles = useValue(engine.profiles)
   const activeId = useValue(engine.activeProfile)
   const [draft, setDraft] = useState('')
+  // Which profile's Overwrite button is armed. One click arms, the second
+  // replaces: overwriting a saved board is destructive and must not be a slip.
+  const [armed, setArmed] = useState(null)
 
   return jsxs('div', {
     style: { display: 'flex', flexDirection: 'column', gap: '6px' },
@@ -3812,6 +3857,29 @@ function ProfileManager({ engine }) {
                 jsx('span', {
                   className: 'hermes-sb-profile-count',
                   children: t('padCount', profile.sounds.length)
+                }),
+                // Overwrite: replaces this saved board with the live one, so a
+                // tweaked setup updates the profile instead of adding another.
+                jsx('button', {
+                  type: 'button',
+                  className: 'hermes-sb-profile-overwrite',
+                  'data-overwrite': profile.id,
+                  'data-armed': armed === profile.id,
+                  'aria-label': `${t('overwriteProfile')}: ${profile.name}`,
+                  onClick: () => {
+                    if (armed !== profile.id) {
+                      setArmed(profile.id)
+
+                      return
+                    }
+                    setArmed(null)
+                    engine.overwriteProfile(profile.id)
+                    engine.notify({
+                      kind: 'info',
+                      message: t('profileOverwritten').replace('{name}', profile.name)
+                    })
+                  },
+                  children: armed === profile.id ? t('overwriteConfirm') : t('overwrite')
                 }),
                 jsx('button', {
                   type: 'button',
@@ -4228,6 +4296,10 @@ const LOCALES = {
     renameProfile: 'Rename',
     deleteProfile: 'Delete profile',
     profileSaved: 'Profile saved.',
+    overwrite: 'Overwrite',
+    overwriteConfirm: 'Replace?',
+    overwriteProfile: 'Overwrite profile',
+    profileOverwritten: 'Updated profile {name}.',
     profileDeleted: 'Deleted profile {name}.',
     previousProfile: 'Previous board',
     newProfile: 'Profile',
@@ -4350,6 +4422,10 @@ const LOCALES = {
     renameProfile: 'Zmień nazwę',
     deleteProfile: 'Usuń profil',
     profileSaved: 'Profil zapisany.',
+    overwrite: 'Nadpisz',
+    overwriteConfirm: 'Zastąpić?',
+    overwriteProfile: 'Nadpisz profil',
+    profileOverwritten: 'Zaktualizowano profil {name}.',
     profileDeleted: 'Usunięto profil {name}.',
     previousProfile: 'Poprzednia plansza',
     newProfile: 'Profil',

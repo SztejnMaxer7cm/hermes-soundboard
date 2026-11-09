@@ -1193,6 +1193,35 @@ console.log(`profiles after save: ${JSON.stringify(saved)}`)
 if (!saved.length) console.log('!! saving did not create a profile row')
 if (saved.length && !saved.some(p => p.active)) console.log('!! the saved profile is not marked active')
 
+// ── overwrite: the button must arm, then replace ────────────────────────
+const ovrCount = await page.evaluate(() =>
+  [...document.querySelectorAll('[data-overwrite]')].length)
+if (ovrCount !== saved.length) {
+  console.log(`!! expected an Overwrite button per profile, got ${ovrCount} for ${saved.length}`)
+}
+await page.click('[data-overwrite]')
+await page.waitForTimeout(200)
+const armedState = await page.evaluate(() => {
+  const btn = document.querySelector('[data-overwrite]')
+  return { armed: btn?.dataset.armed, label: btn?.textContent.trim() }
+})
+console.log(`overwrite armed: ${JSON.stringify(armedState)}`)
+if (armedState.armed !== 'true') console.log('!! one click replaced immediately — it must arm first')
+if (armedState.label !== 'Replace?') console.log(`!! the armed label reads "${armedState.label}"`)
+await shot('preview-profiles-overwrite.png')
+const rowsBeforeOverwrite = saved.length
+await page.click('[data-overwrite]')
+await page.waitForTimeout(250)
+const afterOverwrite = await page.evaluate(() => ({
+  rows: document.querySelectorAll('.hermes-sb-profile-row').length,
+  stillArmed: document.querySelector('[data-overwrite]')?.dataset.armed
+}))
+console.log(`after overwrite: ${JSON.stringify(afterOverwrite)}`)
+if (afterOverwrite.rows !== rowsBeforeOverwrite) {
+  console.log(`!! overwriting changed the profile count ${rowsBeforeOverwrite} -> ${afterOverwrite.rows}`)
+}
+if (afterOverwrite.stillArmed === 'true') console.log('!! the button stayed armed after replacing')
+
 // Make a second profile, then switch away from it — the active row's button is
 // disabled on purpose, so the click has to target an inactive one.
 // We are on the settings page, so the edit happens there: reordering is a real

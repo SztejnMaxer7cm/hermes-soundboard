@@ -240,9 +240,15 @@ with rename and delete, which need a text field per row.
 
 Two behaviours worth knowing:
 
+- **Overwrite instead of accumulating.** Each saved profile has an **Overwrite**
+  button in Settings: it replaces that profile's board with the live one, keeping
+  its name. One click arms it ("Replace?"), the second replaces — a saved board
+  is worth protecting from a slip. Typing an existing profile's name into the
+  save field does the same thing, so a tweaked setup updates its profile instead
+  of becoming "Studio 2".
 - **Save in place vs. save as new.** Saving under the active profile's name
-  overwrites it — the common case is "I tweaked my board". Typing a *different*
-  name creates a second profile instead of renaming the open one.
+  overwrites it — the common case is "I tweaked my board". Typing a genuinely
+  new name creates a second profile instead of renaming the open one.
 - **Switching away from an unsaved board keeps it**, saved as "Previous board"
   the first time. Switching is otherwise a silent way to lose work.
 
