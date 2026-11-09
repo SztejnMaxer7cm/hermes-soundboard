@@ -1048,6 +1048,11 @@ function createEngine(ctx) {
   const t = ctx.i18n.t
   const sounds = atom(cleanSounds(ctx.storage.get('sounds', null)))
   const settings = atom(cleanSettings(ctx.storage.get('settings', {})))
+  /** null until probed. false when this build has no `ctx.files` door — the web
+   *  build, where `window.hermesDesktop` is absent and every call answers
+   *  'unavailable'. Clips cannot be stored or read without it, so the UI has to
+   *  say that rather than let a pad look broken. */
+  const fileAccess = atom(null)
   /** Saved snapshots of the pads + settings. The live set is what you edit;
    *  a profile is what you restore. */
   const profiles = atom(cleanProfiles(ctx.storage.get('profiles', null)))
@@ -1123,6 +1128,28 @@ function createEngine(ctx) {
   }
 
   /** Master volume × this pad's own trim, clamped to something playable. */
+  /** Is there a working file door? A probe, not a platform check: an older
+   *  desktop shell can also answer 'unavailable', and a browser cannot answer
+   *  anything else. `stat` on a path that does not exist still returns
+   *  ok:true, exists:false on desktop, so this never creates a file. */
+  const probeFileAccess = async () => {
+    const files = ctx.files
+    if (!files) {
+      fileAccess.set(false)
+
+      return
+    }
+    try {
+      const result = await files.stat(files.dataFolder, '.access-probe')
+      fileAccess.set(!(result && result.ok === false && result.error === 'unavailable'))
+    } catch {
+      // A throwing door is a working door with an unexpected complaint; assume
+      // access rather than removing features over it.
+      fileAccess.set(true)
+    }
+  }
+  void probeFileAccess()
+
   function gainFor(sound) {
     const master = settings.get().volume / 100
     const trim = Number.isFinite(sound?.gain) ? sound.gain / 100 : 1
@@ -2065,6 +2092,7 @@ function createEngine(ctx) {
   return {
     sounds,
     settings,
+    fileAccess,
     open,
     active,
     saving,
@@ -2154,6 +2182,10 @@ const CSS = `
 .hermes-sb-add:hover{background:var(--chrome-action-hover);box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary);color:var(--ui-text-primary)}
 .hermes-sb-add:disabled{opacity:.5;cursor:default}
 .hermes-sb-empty{padding:18px 8px;text-align:center;font-size:11px;line-height:16px;color:var(--ui-text-tertiary)}
+/* Shown when this build has no plugin file door (the web build). */
+.hermes-sb-note{margin:0 0 6px;padding:4px 6px;border-radius:4px;font-size:10px;line-height:14px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
 /* An open picker needs vertical room. Without this the 14-row menu is much
    taller than the list's 268px window, so you can only ever see a slice of it
@@ -3221,6 +3253,7 @@ function Panel({ engine }) {
   const saving = useValue(engine.saving)
   const last = useValue(engine.lastTrigger)
   const ytJob = useValue(engine.ytJob)
+  const fileAccess = useValue(engine.fileAccess)
   const [manage, setManage] = useState(false)
   const [dragging, setDragging] = useState(false)
   // Which pad is being dragged, and which gap it would drop into.
@@ -3347,24 +3380,25 @@ function Panel({ engine }) {
             })
           }),
           jsx(Tip, {
-            label: t('addSound'),
+            label: fileAccess === false ? t('clipsDesktopOnly') : t('addSound'),
             children: jsx('button', {
               type: 'button',
               className: 'hermes-sb-iconbtn',
-              'aria-label': t('addSound'),
-              disabled: saving,
+              'aria-label': fileAccess === false ? t('clipsDesktopOnly') : t('addSound'),
+              disabled: saving || fileAccess === false,
               onClick: () => fileRef.current?.click(),
               children: saving ? jsx(icons.Loader2, { size: 11 }) : jsx(icons.Plus, { size: 12 })
             })
           }),
           jsx(Tip, {
-            label: t('ytOpen'),
+            label: fileAccess === false ? t('clipsDesktopOnly') : t('ytOpen'),
             children: jsx('button', {
               type: 'button',
               className: 'hermes-sb-iconbtn',
               'data-on': ytOpen,
               'aria-expanded': ytOpen,
-              'aria-label': t('ytOpen'),
+              'aria-label': fileAccess === false ? t('clipsDesktopOnly') : t('ytOpen'),
+              disabled: fileAccess === false,
               onClick: () => {
                 haptic('tap')
                 setYtOpen(value => !value)
@@ -3386,6 +3420,17 @@ function Panel({ engine }) {
           })
         ]
       }),
+
+      // No file door: say so once, plainly. A pad holding a clip cannot play
+      // here, and a user hearing silence from a pad that still looks clickable
+      // has no way to tell that from a bug.
+      fileAccess === false
+        ? jsx('div', {
+            className: 'hermes-sb-note',
+            'data-clips-off': 'true',
+            children: t('clipsDesktopOnly')
+          })
+        : null,
 
       jsx('input', {
         ref: fileRef,
@@ -3947,6 +3992,7 @@ function SoundboardManager({ engine }) {
   const t = usePluginI18n(ID)
   const sounds = useValue(engine.sounds)
   const saving = useValue(engine.saving)
+  const fileAccess = useValue(engine.fileAccess)
   const fileRef = useRef(null)
   const [ytOpen, setYtOpen] = useState(false)
   const [ytUrl, setYtUrl] = useState('')
@@ -4001,7 +4047,8 @@ function SoundboardManager({ engine }) {
           jsx('button', {
             type: 'button',
             className: 'hermes-sb-settings-add',
-            disabled: saving || sounds.length >= MAX_SOUNDS,
+            disabled: saving || sounds.length >= MAX_SOUNDS || fileAccess === false,
+            title: fileAccess === false ? t('clipsDesktopOnly') : undefined,
             onClick: () => fileRef.current?.click(),
             children: saving ? t('saving') : t('addSound')
           }),
@@ -4010,6 +4057,8 @@ function SoundboardManager({ engine }) {
             className: 'hermes-sb-settings-add',
             'data-on': ytOpen,
             'aria-expanded': ytOpen,
+            disabled: fileAccess === false,
+            title: fileAccess === false ? t('clipsDesktopOnly') : undefined,
             onClick: () => setYtOpen(value => !value),
             children: t('ytOpen')
           }),
@@ -4019,6 +4068,16 @@ function SoundboardManager({ engine }) {
           })
         ]
       }),
+
+      // Same explanation as the panel: clips live on disk, and this build has
+      // no disk. Without it, "Add a sound file" just does nothing.
+      fileAccess === false
+        ? jsx('div', {
+            className: 'hermes-sb-note',
+            'data-clips-off': 'true',
+            children: t('clipsDesktopOnly')
+          })
+        : null,
 
       jsx('input', {
         ref: fileRef,
@@ -4352,6 +4411,7 @@ const LOCALES = {
     exportMissing: (n, names) =>
       `${n} clip${n === 1 ? '' : 's'} could not be read, so ${n === 1 ? 'it is' : 'they are'} missing from the file: ${names}.`,
     exportFailed: 'The setup file could not be saved.',
+    clipsDesktopOnly: 'Clips need the desktop app — only synthesised pads play here.',
     thisFile: 'this file',
     importPlan: (name, pads) => `“${name}” holds ${pads} pad${pads === 1 ? '' : 's'}`,
     importMode: 'Where the pads go',
@@ -4475,6 +4535,7 @@ const LOCALES = {
     exportedAsk: name => `„${name}” jest gotowy — zapisz go w oknie dialogowym.`,
     exportMissing: (n, names) => `Nie udało się odczytać ${n} klipu/klipów, więc brakuje ich w pliku: ${names}.`,
     exportFailed: 'Nie udało się zapisać pliku zestawu.',
+    clipsDesktopOnly: 'Klipy wymagają aplikacji desktopowej — tutaj grają tylko podkładki syntezowane.',
     thisFile: 'ten plik',
     importPlan: (name, pads) => `„${name}” zawiera ${pads} padów`,
     importMode: 'Gdzie trafią pady',

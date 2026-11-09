@@ -358,6 +358,27 @@ file). The plugin is enabled by default; it stays off if you toggle it off in
   (base64 costs another third). The importer refuses anything over 96 MB, which
   is more than a full 40-pad board can ever weigh.
 
+## The web build
+
+Hermes also runs in a browser, and there is **no plugin file door** there:
+`ctx.files` resolves `window.hermesDesktop?.pluginFiles`, which is undefined
+outside Electron, so every call answers
+`{ ok: false, error: 'unavailable' }`. Clips live on disk, so anything that
+stores or reads one is desktop-only:
+
+| Works in the browser | Desktop only |
+|---|---|
+| Synthesised pads, triggers, random pick, one-at-a-time | Adding a sound file |
+| Volume, per-pad gain, pads per row, label | YouTube import |
+| Profiles (save, switch, overwrite, rename, delete) | Trimming clips |
+| Export a setup file (browser download carries it) | Clips inside an export, and importing clip pads |
+
+The plugin probes the door at startup and, when it is missing, says so in the
+panel and in Settings, and disables the controls that cannot work — a pad that
+looks clickable and plays nothing is indistinguishable from a bug. A pad that
+already holds a clip also reports the reason when clicked instead of failing
+silently.
+
 ## How it is built
 
 **One scroll container per surface.** The trigger menu is a block in flow inside

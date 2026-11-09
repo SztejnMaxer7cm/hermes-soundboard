@@ -622,6 +622,16 @@ const pickers = await page.$$eval('.hermes-sb-picker', nodes =>
     })()
   }))
 )
+// Desktop has a file door, so the "clips need the desktop app" note must NOT
+// appear here — the web-mode check in harness.mjs covers the other branch.
+const desktopFileAccess = await page.evaluate(() => ({
+  note: Boolean(document.querySelector('[data-clips-off="true"]')),
+  addDisabled: document.querySelector('.hermes-sb-panel button[aria-label="Add a sound file"]')?.disabled
+}))
+console.log(`desktop file access: ${JSON.stringify(desktopFileAccess)}`)
+if (desktopFileAccess.note) console.log('!! the desktop build claims clips need the desktop app')
+if (desktopFileAccess.addDisabled === true) console.log('!! the add-file button is disabled on desktop')
+
 console.log(`trigger pickers: ${pickers.length}`)
 if (pickers.length) console.log(`  first: "${pickers[0].text}" ${pickers[0].box.w}x${pickers[0].box.h} @y${pickers[0].box.y}`)
 

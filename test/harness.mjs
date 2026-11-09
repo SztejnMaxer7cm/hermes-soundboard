@@ -1549,6 +1549,115 @@ check('every icon the plugin references exists in the SDK', () => {
 })
 iconBoot.dispose()
 
+// ── web build: there is no Electron bridge ─────────────────────────────
+// createPluginFiles() resolves `window.hermesDesktop?.pluginFiles`; in a browser
+// that is undefined, so EVERY ctx.files call answers
+// { ok: false, error: 'unavailable' }. Anything that stores or reads a clip is
+// therefore desktop-only, and the plugin has to say so instead of going quiet.
+const webUnavailable = {
+  ok: false,
+  error: 'unavailable',
+  message: 'This Hermes Desktop build has no plugin file access.'
+}
+const webCtx = makeCtx()
+const webNotes = []
+webCtx.ctx.notify = opts => webNotes.push(String(opts?.message ?? ''))
+webCtx.ctx.files = {
+  dataFolder: 'data',
+  folders: async () => [],
+  requestFolder: async () => webUnavailable,
+  release: async () => false,
+  list: async () => webUnavailable,
+  stat: async () => webUnavailable,
+  readText: async () => webUnavailable,
+  readDataUrl: async () => webUnavailable,
+  writeText: async () => webUnavailable,
+  rename: async () => webUnavailable,
+  trash: async () => webUnavailable
+}
+storage.set('sounds', JSON.stringify([
+  { id: 'web-syn', name: 'WebPop', kind: 'synth', synth: 'pop', triggers: ['turn.complete'] },
+  { id: 'web-file', name: 'WebClip', kind: 'file', mime: 'audio/mpeg', bytes: 100 }
+]))
+storage.delete('profiles')
+storage.delete('activeProfile')
+plugin.register(webCtx.ctx)
+const webEngine = webCtx.ctx.__engine
+
+check('web: a synthesised pad still plays', () => {
+  const before = audioLog.started
+  webEngine.play(webEngine.sounds.get().find(sound => sound.id === 'web-syn'))
+  if (audioLog.started <= before) throw new Error('no oscillator started')
+})
+
+check('web: a stored clip reports why it cannot play', async () => {
+  webNotes.length = 0
+  webEngine.play(webEngine.sounds.get().find(sound => sound.id === 'web-file'))
+  // play() surfaces playback failures as a toast; give the rejection a tick.
+  await new Promise(resolve => setTimeout(resolve, 60))
+  if (!webNotes.length) throw new Error('the pad went silent with no explanation')
+  if (!/file access|unavailable/i.test(webNotes.join(' '))) {
+    throw new Error(`unhelpful message: ${JSON.stringify(webNotes)}`)
+  }
+})
+
+check('web: YouTube import refuses instead of adding a dead pad', async () => {
+  const before = webEngine.sounds.get().length
+  let message = ''
+  try {
+    await webEngine.importYoutube('https://www.youtube.com/watch?v=jNQXAC9IVRw')
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error)
+  }
+  if (webEngine.sounds.get().length !== before) throw new Error('a pad was added on the web build')
+  if (!message) throw new Error('the import neither resolved nor explained itself')
+  console.log(`  web import said: ${message}`)
+})
+
+check('web: uploading a file does not pretend to save it', async () => {
+  const before = webEngine.sounds.get().length
+  const file = new File([new Uint8Array([1, 2, 3])], 'clip.mp3', { type: 'audio/mpeg' })
+  await webEngine.addFile(file)
+  if (webEngine.sounds.get().length !== before) throw new Error('a clip was added without a place to store it')
+})
+
+check('web: profiles still save and apply', () => {
+  const id = webEngine.saveProfile('WebProfile')
+  if (!id) throw new Error('saving a profile failed')
+  const stored = webEngine.profiles.get().find(profile => profile.id === id)
+  if (!stored || stored.sounds.length !== 2) throw new Error('the profile did not capture the board')
+  webEngine.applyProfile(id)
+  if (webEngine.sounds.get().length !== 2) throw new Error('applying the profile lost pads')
+})
+
+check('web: settings and triggers still work', () => {
+  webEngine.setVolume(42)
+  if (webEngine.settings.get().volume !== 42) throw new Error('volume did not persist')
+})
+
+// The probe is async; let it settle before reading the rendered UI.
+await new Promise(resolve => setTimeout(resolve, 30))
+check('web: the build is detected as having no file door', () => {
+  if (webEngine.fileAccess.get() !== false) {
+    throw new Error(`fileAccess=${webEngine.fileAccess.get()} — the probe did not notice`)
+  }
+})
+
+check('web: the panel explains that clips need the desktop app', () => {
+  const panel = webCtx.contributions.find(c => c.area === 'statusBar.right')
+  const mounted = mount(panel.render())
+  click(mounted.host.querySelector('button'))
+  const note = mounted.host.querySelector('[data-clips-off="true"]')
+  if (!note) throw new Error('no explanation is shown — a silent failed pad looks broken')
+  if (!/desktop/i.test(note.textContent)) throw new Error(`unhelpful note: ${note.textContent}`)
+  // Both clip-producing controls must be disabled rather than invite a click.
+  const add = mounted.host.querySelector('button[aria-label*="desktop" i]')
+  if (!add) throw new Error('the add button does not name the limitation')
+  if (!add.disabled) throw new Error('the add button is still enabled')
+  mounted.unmount()
+})
+webCtx.dispose()
+
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 
 const failed = results.filter(row => !row.ok)
