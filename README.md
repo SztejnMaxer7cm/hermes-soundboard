@@ -354,6 +354,14 @@ file). The plugin is enabled by default; it stays off if you toggle it off in
 
 ## How it is built
 
+**One scroll container per surface.** The trigger menu is a block in flow inside
+the manage list, and the list does the scrolling. Giving the menu its own
+`max-height`/`overflow` made two nested scrollers, and because both set
+`overscroll-behavior: contain` the chain never passed outward — a picker opened
+near the bottom of the board could not reach its last rows at all. The list also
+grows its viewport while a menu is open (`:has(.hermes-sb-menu)`), and the picker
+scrolls its own menu into view when it opens below the fold.
+
 One plain-ESM file, no build step, no dependencies — the two things the Desktop
 loader resolves at runtime are `@hermes/plugin-sdk` and `react/jsx-runtime`:
 

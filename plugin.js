@@ -2134,6 +2134,11 @@ const CSS = `
 .hermes-sb-add:disabled{opacity:.5;cursor:default}
 .hermes-sb-empty{padding:18px 8px;text-align:center;font-size:11px;line-height:16px;color:var(--ui-text-tertiary)}
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
+/* An open picker needs vertical room. Without this the 14-row menu is much
+   taller than the list's 268px window, so you can only ever see a slice of it
+   and have to scroll the whole board to reach the rest. The list still scrolls;
+   it just gets a taller viewport while a menu is open. */
+.hermes-sb-list:has(.hermes-sb-menu){max-height:min(66vh,460px)}
 .hermes-sb-row{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
 .hermes-sb-row .hermes-sb-row-name{flex:1;min-width:0;font-size:11px;text-overflow:ellipsis}
 /* The trigger picker is a button + an in-DOM menu, NOT a native <select>.
@@ -2172,8 +2177,13 @@ const CSS = `
    absolute got clipped by the manage list's scroll container, and fixed
    re-anchored to the popover (whose backdrop-filter makes it the containing
    block), which is why the picker looked dead in the app while passing tests. */
+/* NO INNER SCROLL. This is a block in flow, and the manage list around it is
+   already a scroll container. Giving the menu its own max-height and overflow
+   made two nested scrollers, and because both set overscroll-behavior:contain
+   the chain never passed from the inner one to the outer one — so a picker
+   opened low in the list could not be scrolled to its last rows at all. One
+   container: the list scrolls, the menu is just tall. */
 .hermes-sb-menu{flex:0 0 100%;width:100%;margin-top:2px;
-  max-height:238px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;
   padding:3px;border-radius:5px;
   background-color:var(--ui-bg-elevated);border:1px solid var(--ui-stroke-secondary);
   box-shadow:0 10px 26px rgba(0,0,0,.55)}
@@ -2529,12 +2539,36 @@ function TriggerSelect({ sound, engine }) {
   const [open, setOpen] = useState(false)
   const [cursor, setCursor] = useState(-1)
   const boxRef = useRef(null)
+  const menuRef = useRef(null)
   const boundIds = sound.triggers ?? []
   const boundTriggers = boundIds.map(id => TRIGGER_BY_ID.get(id)).filter(Boolean)
 
   // Flat list of selectable rows in render order, so the cursor can move over
   // a grouped list without knowing about the groups.
   const flat = TRIGGERS.map(trigger => trigger)
+
+  useEffect(() => {
+    if (!open) return
+    // Bring the menu into view inside the board's list. Opening a picker on one
+    // of the lower rows otherwise reveals a menu that starts below the fold, so
+    // it looked like the list was cut off with no way to reach the rest.
+    // Scrolls ONLY the list (not scrollIntoView, which would also move the
+    // popover): a minimal nudge to make the menu fully visible.
+    const node = menuRef.current
+    const scroller = node?.closest('.hermes-sb-list')
+    if (!node || !scroller) return
+    const menuBox = node.getBoundingClientRect()
+    const viewBox = scroller.getBoundingClientRect()
+    if (menuBox.height > viewBox.height) {
+      // Taller than the window: aligning its top is the only honest position,
+      // then the list scrolls through the rest.
+      scroller.scrollTop += menuBox.top - viewBox.top
+    } else if (menuBox.bottom > viewBox.bottom) {
+      scroller.scrollTop += menuBox.bottom - viewBox.bottom + 4
+    } else if (menuBox.top < viewBox.top) {
+      scroller.scrollTop -= viewBox.top - menuBox.top + 4
+    }
+  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -2623,6 +2657,7 @@ function TriggerSelect({ sound, engine }) {
       open
         ? jsx('div', {
             className: 'hermes-sb-menu',
+            ref: menuRef,
             role: 'listbox',
             'aria-multiselectable': 'true',
             'aria-label': t('when'),

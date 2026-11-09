@@ -676,7 +676,18 @@ if (!/^rgb/.test(menu.background) || menu.background.includes('rgba(0, 0, 0, 0)'
 if (menuRatio !== null && menuRatio < 4.5) console.log(`!! menu row text fails 4.5:1 (${menuRatio.toFixed(2)})`)
 if (headingRatio !== null && headingRatio < 3) console.log(`!! group label fails 3:1 (${headingRatio.toFixed(2)})`)
 if (menu.rows !== 14) console.log(`!! expected 14 trigger rows, got ${menu.rows}`)
-if (menu.box.y + menu.box.h > 560) console.log('!! the menu runs off the bottom of the viewport')
+if (menu.box.y + menu.box.h > 560) {
+  // The menu is legitimately taller than the list's window now that it has no
+  // inner scroll of its own; the LIST scrolls it. What must hold is that the
+  // list can actually reach the menu's bottom.
+  const reachable = await page.evaluate(() => {
+    const list = document.querySelector('.hermes-sb-list')
+    const node = document.querySelector('.hermes-sb-menu')
+    if (!list || !node) return false
+    return list.scrollHeight >= node.getBoundingClientRect().height
+  })
+  if (!reachable) console.log('!! the menu is taller than the list can scroll')
+}
 // The menu must be INSIDE the panel and on screen. A fixed-positioned menu
 // anchored to a backdrop-filtered popover still reports a plausible width, so
 // check containment in the panel's own box — this is what catches that bug.
@@ -693,10 +704,81 @@ if (escaped) console.log('!! the menu escapes the panel box — it is being re-a
 if (menu.box.w < 200) console.log(`!! the menu is only ${menu.box.w}px wide — it is confined to the picker's box, not the row's`)
 await shot('preview-menu.png')
 
+// ── a picker low in the list must still reach its last row ──────────────
+// Reported: opening the trigger list on a row near the bottom left the menu
+// unscrollable to its end. Cause was two nested scroll containers — the menu had
+// its own max-height/overflow inside the manage list, and both set
+// overscroll-behavior:contain, so the chain never passed outward.
+const reach = await page.evaluate(async () => {
+  const rows = [...document.querySelectorAll('.hermes-sb-row')]
+  if (rows.length < 2) return { error: 'not enough rows to test the last one' }
+  // Close whatever is open, then open the picker on the LAST row.
+  const open = document.querySelector('.hermes-sb-menu')
+  if (open) open.closest('.hermes-sb-when')?.querySelector('.hermes-sb-picker')?.click()
+  const last = rows[rows.length - 1].querySelector('.hermes-sb-picker')
+  last.click()
+  await new Promise(r => setTimeout(r, 250))
+  const menu = document.querySelector('.hermes-sb-menu')
+  if (!menu) return { error: 'the menu did not open on the last row' }
+  const style = getComputedStyle(menu)
+  const list = document.querySelector('.hermes-sb-list')
+  // Measure WITHOUT scrolling by hand: the picker must bring its own menu into
+  // view, otherwise opening one low in the board reveals a menu below the fold.
+  const autoBox = menu.getBoundingClientRect()
+  const autoView = list.getBoundingClientRect()
+  const autoTopVisible = autoBox.top >= autoView.top - 1
+  // Then scroll the list to its end, as a wheel would, and require the whole
+  // menu — including the conditional Never button — to be reachable.
+  list.scrollTop = list.scrollHeight
+  await new Promise(r => setTimeout(r, 250))
+  const listBox = list.getBoundingClientRect()
+  const items = [...menu.querySelectorAll('.hermes-sb-menu-row')]
+  const final = items[items.length - 1]
+  const finalBox = final.getBoundingClientRect()
+  const clear = document.querySelector('.hermes-sb-menu-clear')
+  const clearBox = clear ? clear.getBoundingClientRect() : null
+  const menuBox = menu.getBoundingClientRect()
+  return {
+    innerScroll: style.overflowY,
+    innerMaxHeight: style.maxHeight,
+    items: items.length,
+    autoTopVisible,
+    // The final row must sit inside the list's visible window after scrolling.
+    finalVisible: finalBox.bottom <= listBox.bottom + 1 && finalBox.top >= listBox.top - 1,
+    clearVisible: clearBox ? clearBox.bottom <= listBox.bottom + 1 : null,
+    // The whole menu, including the conditional "Never" button at its very
+    // bottom, must be reachable by scrolling the list to its end.
+    menuBottomVisible: menuBox.bottom <= listBox.bottom + 1,
+    overflowBelow: Math.round(Math.max(0, menuBox.bottom - listBox.bottom))
+  }
+})
+console.log(`last-row picker: ${JSON.stringify(reach)}`)
+if (reach.error) console.log(`!! ${reach.error}`)
+if (reach.innerScroll && reach.innerScroll !== 'visible') {
+  console.log(`!! the menu scrolls itself (overflow-y:${reach.innerScroll}) inside a scrolling list — a nested scroller cannot be chained out of`)
+}
+if (reach.error === undefined && reach.autoTopVisible === false) {
+  console.log('!! the menu opens below the fold — a picker low in the board must scroll its own menu into view')
+}
+if (reach.error === undefined && (reach.menuBottomVisible === false || reach.finalVisible === false)) {
+  console.log(`!! the end of the menu stays ${reach.overflowBelow}px below the list's edge even when scrolled to the end`)
+}
+await shot('preview-menu-last-row.png')
+// Leave the global state as the next section expects it: shut this menu so the
+// multi-select test opens its own picker on the first row.
+await page.evaluate(() => {
+  document.querySelector('.hermes-sb-menu')?.closest('.hermes-sb-when')?.querySelector('.hermes-sb-picker')?.click()
+})
+await page.waitForTimeout(150)
+
 // ── multi-select, in a real browser ─────────────────────────────────────
 // Two triggers on ONE pad: click the first, then the second, without the menu
 // closing — that is the whole feature, so it gets verified in Chromium and not
 // only in jsdom.
+// Open the first row's picker explicitly: the previous section now cleans up
+// after itself, so the menu cannot be assumed to still be open.
+await page.click('.hermes-sb-row .hermes-sb-picker')
+await page.waitForSelector('.hermes-sb-menu', { timeout: 3000 })
 await page.click('.hermes-sb-menu-row:has-text("Approval needed")')
 await page.waitForTimeout(150)
 const stillOpen = await page.$('.hermes-sb-menu')
